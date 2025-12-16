@@ -115,9 +115,7 @@ def _kmeans_1d(values: Sequence[float]) -> Tuple[float, float]:
                 new_centers.append(sum(cluster) / len(cluster))
             else:
                 new_centers.append(centers[idx])
-        if all(
-            math.isclose(a, b) for a, b in zip(centers, new_centers, strict=True)
-        ):
+        if all(math.isclose(a, b) for a, b in zip(centers, new_centers, strict=True)):
             break
         centers = new_centers
     return tuple(sorted(centers))  # type: ignore[return-value]
