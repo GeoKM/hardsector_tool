@@ -14,7 +14,12 @@ from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import decode_fm_bytes, pll_decode_fm_bytes, scan_fm_sectors
-from hardsector_tool.hardsector import assemble_rotation, decode_hole, group_hard_sectors
+from hardsector_tool.hardsector import (
+    assemble_rotation,
+    best_sector_map,
+    decode_hole,
+    group_hard_sectors,
+)
 from hardsector_tool.scp import SCPImage
 
 
@@ -107,6 +112,11 @@ def main() -> None:
         type=int,
         default=0,
         help="Rotation index to decode in hard-sector mode (default 0).",
+    )
+    parser.add_argument(
+        "--sector-map",
+        action="store_true",
+        help="Assemble a best-effort sector map across all rotations (assumes 16x256).",
     )
     args = parser.parse_args()
 
@@ -217,6 +227,26 @@ def main() -> None:
                     print(
                         f"  hole? off={g.offset:06d} C/H/S={g.track}/{g.head}/{g.sector_id} "
                         f"size={g.length} crc_ok={g.crc_ok}"
+                    )
+            if args.sector_map:
+                all_rotations = [
+                    assemble_rotation(image, track, grouping, r, use_pll=args.use_pll)
+                    for r in range(grouping.rotations)
+                ]
+                best = best_sector_map(
+                    all_rotations,
+                    expected_track=tracks[0],
+                    expected_head=0,
+                    expected_sector_count=16,
+                    expected_size=256,
+                )
+                print("\nBest-effort sector map (first 16 IDs):")
+                for sid in sorted(best.keys()):
+                    g = best[sid]
+                    status = "ok" if g.crc_ok else "crc?"
+                    print(
+                        f"  sector {sid:02d}: C/H/S={g.track}/{g.head}/{g.sector_id} "
+                        f"len={g.length} status={status}"
                     )
 
 

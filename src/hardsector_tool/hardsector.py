@@ -10,7 +10,7 @@ analysis easier.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .fm import (
     SectorGuess,
@@ -105,3 +105,27 @@ def assemble_rotation(
         if guess:
             guesses.append(guess)
     return guesses
+
+
+def best_sector_map(
+    rotations: List[List[SectorGuess]],
+    expected_track: int,
+    expected_head: int = 0,
+    expected_sector_count: int = 16,
+    expected_size: int = 256,
+) -> Dict[int, SectorGuess]:
+    """
+    Pick the best copy for each sector id across rotations.
+    Preference order: valid CRCs, then first occurrence.
+    """
+    best: Dict[int, SectorGuess] = {}
+    for rotation in rotations:
+        for guess in rotation:
+            if guess.track != expected_track or guess.head != expected_head:
+                continue
+            if guess.length != expected_size:
+                continue
+            existing = best.get(guess.sector_id)
+            if not existing or (not existing.crc_ok and guess.crc_ok):
+                best[guess.sector_id] = guess
+    return {sid: g for sid, g in best.items() if sid < expected_sector_count}

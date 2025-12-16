@@ -67,6 +67,39 @@ def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
     return half_med, full_med, threshold
 
 
+def find_sync_bytes(bits: Sequence[int], pattern: int = 0xA1, window: int = 32) -> List[int]:
+    """
+    Locate occurrences of a sync/address mark byte (e.g., 0xA1) that may
+    include missing clock bits, by matching against bit-pattern windows.
+
+    This is a heuristic: we scan the bits for the pattern and allow one
+    missing clock (i.e., a repeated '0') within the last two bitcells.
+    """
+    indices: List[int] = []
+    target = f"{pattern:08b}"
+    for i in range(0, max(0, len(bits) - 8)):
+        window_bits = bits[i : i + 8]
+        as_byte = 0
+        for b in window_bits:
+            as_byte = (as_byte << 1) | (1 if b else 0)
+        if as_byte == pattern:
+            indices.append(i)
+            continue
+        # Allow a single missing clock by tolerating a doubled zero near the end.
+        if len(window_bits) >= 8:
+            adjusted = window_bits.copy()
+            for j in range(len(adjusted) - 2, len(adjusted)):
+                if adjusted[j] == 0:
+                    adjusted[j] = 1
+                    as_adj = 0
+                    for b in adjusted:
+                        as_adj = (as_adj << 1) | (1 if b else 0)
+                    if as_adj == pattern:
+                        indices.append(i)
+                        break
+    return indices
+
+
 def decode_fm_bits(flux: Sequence[int], threshold: float | None = None) -> List[int]:
     """
     Decode flux intervals into FM data bits.

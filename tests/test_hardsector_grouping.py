@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from hardsector_tool.hardsector import group_hard_sectors
+from hardsector_tool.hardsector import best_sector_map, group_hard_sectors
+from hardsector_tool.fm import scan_fm_sectors
 from hardsector_tool.scp import SCPImage
 
 
@@ -18,3 +19,11 @@ def test_grouping_matches_expected_rotations() -> None:
     assert len(grouping.groups[0]) == 33
     assert grouping.groups[0][0].hole_index == 0
     assert grouping.groups[0][0].revolution_index == 0
+
+
+def test_best_sector_map_prefers_crc_ok() -> None:
+    # Fabricate two sector guesses, one with valid CRC.
+    g_ok = type("G", (), {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": True})
+    g_bad = type("G", (), {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": False})
+    best = best_sector_map([[g_bad], [g_ok]], expected_track=0, expected_head=0)
+    assert best[1] is g_ok
