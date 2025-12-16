@@ -2,9 +2,11 @@ from pathlib import Path
 
 from hardsector_tool.fm import (
     decode_fm_bytes,
+    decode_mfm_bytes,
     estimate_cell_ticks,
     pll_decode_fm_bytes,
     scan_fm_sectors,
+    mfm_bytes_from_bitcells,
 )
 from hardsector_tool.scp import SCPImage
 
@@ -53,3 +55,26 @@ def test_scan_require_sync_filters_results() -> None:
     assert scan_fm_sectors(stream_with_sync, require_sync=False) == []
     # With sync required, it still has too few bytes to form a sector, but call should work.
     assert scan_fm_sectors(stream_with_sync, require_sync=True) == []
+
+
+def test_mfm_bitcell_roundtrip() -> None:
+    # Build a simple MFM-encoded bitcell stream for two bytes: 0xA1, 0x4E
+    # Generate clock/data bits according to MFM rules.
+    def encode_mfm_byte(byte: int, prev_data_bit: int = 0) -> list[int]:
+        bits = []
+        for i in range(8):
+            data_bit = (byte >> (7 - i)) & 1
+            clock_bit = 0 if (data_bit or prev_data_bit) else 1
+            bits.extend([clock_bit, data_bit])
+            prev_data_bit = data_bit
+        return bits, prev_data_bit
+
+    bitcells: list[int] = []
+    prev = 0
+    for b in (0xA1, 0x4E):
+        encoded, prev = encode_mfm_byte(b, prev)
+        bitcells.extend(encoded)
+
+    shift, decoded = mfm_bytes_from_bitcells(bitcells)
+    # Expect to recover the original bytes regardless of offset (shift may be 0)
+    assert decoded[:2] == bytes([0xA1, 0x4E])

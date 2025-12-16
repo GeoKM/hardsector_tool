@@ -119,6 +119,24 @@ def main() -> None:
         help="Assemble a best-effort sector map across all rotations (assumes 16x256).",
     )
     parser.add_argument(
+        "--encoding",
+        choices=["fm", "mfm"],
+        default="fm",
+        help="Encoding to decode when scanning sectors.",
+    )
+    parser.add_argument(
+        "--expected-sectors",
+        type=int,
+        default=16,
+        help="Expected sectors per track when building sector map.",
+    )
+    parser.add_argument(
+        "--sector-size",
+        type=int,
+        default=256,
+        help="Expected sector size in bytes.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -186,7 +204,12 @@ def main() -> None:
             print(f"\nFM decode skipped: hole {rev_index} beyond available revolutions")
             return
         flux = track.decode_flux(rev_index)
-        if args.use_pll:
+        if args.encoding == "mfm":
+            result = pll_decode_fm_bytes(
+                flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
+            )
+            meta = f"MFM via PLL (bit shift {result.bit_shift})"
+        elif args.use_pll:
             result = pll_decode_fm_bytes(
                 flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
             )
@@ -236,6 +259,7 @@ def main() -> None:
                 rotation_index=rotation,
                 use_pll=args.use_pll,
                 require_sync=args.require_sync,
+                encoding=args.encoding,
             )
             if guesses:
                 print(f"\nRotation {rotation} sector guesses (first 16):")
@@ -253,6 +277,7 @@ def main() -> None:
                         r,
                         use_pll=args.use_pll,
                         require_sync=args.require_sync,
+                        encoding=args.encoding,
                     )
                     for r in range(grouping.rotations)
                 ]
@@ -260,8 +285,8 @@ def main() -> None:
                     all_rotations,
                     expected_track=tracks[0],
                     expected_head=0,
-                    expected_sector_count=16,
-                    expected_size=256,
+                    expected_sector_count=args.expected_sectors,
+                    expected_size=args.sector_size,
                 )
                 print("\nBest-effort sector map (first 16 IDs):")
                 for sid in sorted(best.keys()):

@@ -23,7 +23,15 @@ def test_grouping_matches_expected_rotations() -> None:
 
 def test_best_sector_map_prefers_crc_ok() -> None:
     # Fabricate two sector guesses, one with valid CRC.
-    g_ok = type("G", (), {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": True})
-    g_bad = type("G", (), {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": False})
+    g_ok = type(
+        "G",
+        (),
+        {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": True},
+    )
+    g_bad = type(
+        "G",
+        (),
+        {"track": 0, "head": 0, "sector_id": 1, "length": 256, "crc_ok": False},
+    )
     best = best_sector_map([[g_bad], [g_ok]], expected_track=0, expected_head=0)
     assert best[1] is g_ok

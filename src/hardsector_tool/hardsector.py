@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from .fm import (
     SectorGuess,
     decode_fm_bytes,
+    decode_mfm_bytes,
     pll_decode_fm_bytes,
     scan_fm_sectors,
 )
@@ -70,12 +71,19 @@ def decode_hole(
     hole_capture: HoleCapture,
     use_pll: bool = False,
     require_sync: bool = False,
+    encoding: str = "fm",
 ) -> Optional[SectorGuess]:
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
     """
     flux = track.decode_flux(hole_capture.revolution_index)
-    if use_pll:
+    if encoding.lower() == "mfm":
+        decoded = decode_mfm_bytes(
+            flux,
+            sample_freq_hz=image.sample_freq_hz,
+            index_ticks=hole_capture.index_ticks,
+        )
+    elif use_pll:
         decoded = pll_decode_fm_bytes(
             flux,
             sample_freq_hz=image.sample_freq_hz,
@@ -95,6 +103,7 @@ def assemble_rotation(
     rotation_index: int,
     use_pll: bool = False,
     require_sync: bool = False,
+    encoding: str = "fm",
 ) -> List[SectorGuess]:
     """
     Decode all holes in a given rotation and return any sector guesses found.
@@ -103,7 +112,14 @@ def assemble_rotation(
         return []
     guesses: List[SectorGuess] = []
     for hole in grouping.groups[rotation_index]:
-        guess = decode_hole(image, track, hole, use_pll=use_pll, require_sync=require_sync)
+        guess = decode_hole(
+            image,
+            track,
+            hole,
+            use_pll=use_pll,
+            require_sync=require_sync,
+            encoding=encoding,
+        )
         if guess:
             guesses.append(guess)
     return guesses

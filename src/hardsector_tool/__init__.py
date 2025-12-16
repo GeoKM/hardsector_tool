@@ -7,6 +7,7 @@ hard-sectored floppy disk flux captures such as the ACMS80217 sample set.
 
 from .fm import (
     FMDecodeResult,
+    MFMDecodeResult,
     PLLDecodeResult,
     SectorGuess,
     best_aligned_bytes,
@@ -14,12 +15,20 @@ from .fm import (
     crc16_ibm,
     decode_fm_bits,
     decode_fm_bytes,
+    decode_mfm_bytes,
     estimate_cell_ticks,
     pll_decode_bits,
     pll_decode_fm_bytes,
+    mfm_bytes_from_bitcells,
     scan_fm_sectors,
 )
-from .hardsector import HardSectorGrouping, HoleCapture, decode_hole, group_hard_sectors
+from .hardsector import (
+    HardSectorGrouping,
+    HoleCapture,
+    best_sector_map,
+    decode_hole,
+    group_hard_sectors,
+)
 from .scp import SCPImage, SCPHeader, TrackData, RevolutionEntry
 
 __all__ = [
@@ -39,11 +48,15 @@ __all__ = [
     "crc16_ibm",
     "scan_fm_sectors",
     "PLLDecodeResult",
+    "MFMDecodeResult",
+    "decode_mfm_bytes",
+    "mfm_bytes_from_bitcells",
     "SectorGuess",
     "HardSectorGrouping",
     "HoleCapture",
     "group_hard_sectors",
     "decode_hole",
+    "best_sector_map",
 ]
 
 __version__ = "0.0.1"

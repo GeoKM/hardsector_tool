@@ -39,6 +39,13 @@ class PLLDecodeResult:
 
 
 @dataclass(frozen=True)
+class MFMDecodeResult:
+    bytes_out: bytes
+    bit_shift: int
+    method: str = "mfm"
+
+
+@dataclass(frozen=True)
 class SectorGuess:
     offset: int
     track: int
@@ -98,6 +105,41 @@ def find_sync_bytes(bits: Sequence[int], pattern: int = 0xA1, window: int = 32) 
                         indices.append(i)
                         break
     return indices
+
+
+def mfm_bytes_from_bitcells(bitcells: Sequence[int]) -> Tuple[int, bytes]:
+    """
+    Convert a bitcell stream into data bytes by trying both even/odd
+    alignments (clock/data alternation) and picking the one that yields
+    more sync-like bytes (0xA1/0x4E/0xF6).
+    """
+    sync_candidates = {0xA1, 0x4E, 0xF6}
+    best_shift = 0
+    best_bytes = b""
+    best_score = -1
+
+    for start in (0, 1):
+        data_bits = bitcells[start::2]
+        candidate = bits_to_bytes(data_bits)
+        score = sum(candidate.count(val) for val in sync_candidates)
+        if score > best_score:
+            best_score = score
+            best_shift = start
+            best_bytes = candidate
+    return best_shift, best_bytes
+
+
+def decode_mfm_bytes(
+    flux: Sequence[int],
+    sample_freq_hz: float,
+    index_ticks: int | None = None,
+) -> MFMDecodeResult:
+    """
+    Decode MFM data by PLL to bitcells then collapsing alternating clock/data bits.
+    """
+    bitcells = pll_decode_bits(flux, sample_freq_hz, index_ticks=index_ticks)
+    shift, decoded = mfm_bytes_from_bitcells(bitcells)
+    return MFMDecodeResult(bytes_out=decoded, bit_shift=shift)
 
 
 def decode_fm_bits(flux: Sequence[int], threshold: float | None = None) -> List[int]:
