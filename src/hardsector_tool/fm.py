@@ -90,18 +90,61 @@ def scan_bit_patterns(
     return hits
 
 
+def _kmeans_1d(values: Sequence[float]) -> Tuple[float, float]:
+    """
+    Simple two-cluster k-means for 1D values.
+
+    Returns the two cluster centers sorted ascending.
+    """
+
+    if not values:
+        raise ValueError("Cannot cluster empty input")
+
+    low, high = min(values), max(values)
+    if math.isclose(low, high):
+        return low, high
+
+    centers = [low, high]
+    for _ in range(8):
+        clusters = ([], [])
+        for val in values:
+            idx = 0 if abs(val - centers[0]) <= abs(val - centers[1]) else 1
+            clusters[idx].append(val)
+        new_centers = []
+        for idx, cluster in enumerate(clusters):
+            if cluster:
+                new_centers.append(sum(cluster) / len(cluster))
+            else:
+                new_centers.append(centers[idx])
+        if all(math.isclose(a, b) for a, b in zip(centers, new_centers)):
+            break
+        centers = new_centers
+    return tuple(sorted(centers))  # type: ignore[return-value]
+
+
 def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
     """
     Estimate half and full cell durations from a flux interval distribution.
+
+    Hard-sector slices often include long gaps that skew naive medians. We
+    trim long tails and cluster log-scaled intervals into half/full peaks.
     """
     if not flux:
         raise ValueError("Flux list is empty")
 
     values = sorted(flux)
-    mid = len(values) // 2
-    half_med = median(values[:mid]) if mid else float(values[0])
-    full_med = median(values[mid:]) if mid else float(values[0])
-    threshold = (half_med + full_med) / 2.0
+    if len(values) > 8:
+        trim = max(1, int(len(values) * 0.2))
+        values = values[: len(values) - trim]
+
+    logs = [math.log(v) for v in values if v > 0]
+    if len(logs) < 2:
+        half_med = full_med = float(values[0])
+    else:
+        c1, c2 = _kmeans_1d(logs)
+        half_med, full_med = sorted((math.exp(c1), math.exp(c2)))
+
+    threshold = (half_med + full_med) / 2.0 if half_med and full_med else float(values[0])
     return half_med, full_med, threshold
 
 

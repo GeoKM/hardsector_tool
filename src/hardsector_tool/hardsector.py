@@ -150,7 +150,7 @@ def _merge_index_splits(
         return merged, None
 
     med = median(r.index_ticks for r in revs)
-    cutoff = med * 0.75 if med else 0
+    cutoff = med * 0.7 if med else 0
     candidates: list[tuple[int, int]] = []
     for idx, rev in enumerate(revs):
         nxt = (idx + 1) % len(revs)

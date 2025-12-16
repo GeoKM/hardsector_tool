@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Iterable
 
 from hardsector_tool.fm import (
@@ -350,6 +350,21 @@ def main() -> None:
         default=4096,
         help="Bytes to consider when scoring grid candidates (default 4096).",
     )
+    parser.add_argument(
+        "--show-hole-timing",
+        action="store_true",
+        help="Print normalized hole timings and highlight short index-split pair.",
+    )
+    parser.add_argument(
+        "--auto-invert",
+        action="store_true",
+        help="Try both bitcell polarities and pick the higher-scoring candidate.",
+    )
+    parser.add_argument(
+        "--auto-clock-scale",
+        action="store_true",
+        help="Sweep common clock scales and pick the best-scoring candidate.",
+    )
     args = parser.parse_args()
     if args.mark_payload_dir:
         args.bruteforce_marks = True
@@ -449,6 +464,20 @@ def main() -> None:
                         f" Index-split short pair starts at capture {short} "
                         f"(holes {short} & {(short + 1) % (args.physical_sectors + 1)})"
                     )
+            if args.show_hole_timing and grouping.groups:
+                durations = [h.index_ticks for h in grouping.groups[0]]
+                med = median(durations) if durations else 0
+                labels = []
+                short_pair = grouping.short_pair_positions[0]
+                for idx, ticks in enumerate(durations):
+                    marker = ""
+                    if short_pair is not None and idx in {short_pair, (short_pair + 1) % len(durations)}:
+                        marker = "*"
+                    labels.append(f"{idx:02d}:{ticks}{marker}")
+                print(
+                    " Normalized hole durations (rot0): med="
+                    f"{med:.1f} ticks -> {' '.join(labels)}"
+                )
             avg_tick = (
                 sum(r.index_ticks for r in track.revolutions) / track.revolution_count
             )
@@ -496,14 +525,14 @@ def main() -> None:
             result = decode_mfm_bytes(
                 flux,
                 sample_freq_hz=image.sample_freq_hz,
-                index_ticks=track.revolutions[0].index_ticks,
+                index_ticks=track.revolutions[rev_index].index_ticks,
             )
             meta = f"MFM via PLL (bit shift {result.bit_shift})"
         elif args.use_pll:
             result = pll_decode_fm_bytes(
                 flux,
                 sample_freq_hz=image.sample_freq_hz,
-                index_ticks=track.revolutions[0].index_ticks,
+                index_ticks=track.revolutions[rev_index].index_ticks,
             )
             meta = f"pll clock ~{result.initial_clock_ticks:.1f} ticks"
         else:
@@ -847,14 +876,64 @@ def main() -> None:
                     continue
                 first_rot = grouping.groups[0]
 
+                clock_scale = args.clock_scale
+                invert_bits = args.invert_bitcells
+
+                def score_candidate(bitcells: list[int]) -> tuple:
+                    if args.encoding == "mfm":
+                        _, candidate_bytes = mfm_bytes_from_bitcells(bitcells)
+                    else:
+                        _, candidate_bytes = fm_bytes_from_bitcells(bitcells)
+                    window = candidate_bytes[: args.score_window]
+                    mark_set = {0xFE, 0xFB, 0xFA, 0xA1}
+                    mark_count = sum(1 for b in window if b in mark_set)
+                    fill_ratio, entropy = payload_metrics(window)
+                    return (-mark_count, fill_ratio, -entropy, mark_count, entropy)
+
+                if args.auto_invert or args.auto_clock_scale:
+                    stitched_flux, stitched_ticks = stitch_rotation_flux(
+                        track,
+                        grouping,
+                        rotation_index=0,
+                        compensate_gaps=args.stitch_gap_comp,
+                    )
+                    base_flux = stitched_flux if stitched_flux else track.decode_flux(0)
+                    base_ticks = (
+                        stitched_ticks if stitched_ticks else track.revolutions[0].index_ticks
+                    )
+                    best = None
+                    for inv in (False, True):
+                        if args.auto_invert is False and inv != args.invert_bitcells:
+                            continue
+                        for scale in (0.5, 0.75, 1.0, 1.25, 1.5):
+                            if not args.auto_clock_scale and scale != args.clock_scale:
+                                continue
+                            flux_scaled = [max(1, int(x * scale)) for x in base_flux]
+                            bitcells = pll_decode_bits(
+                                flux_scaled,
+                                sample_freq_hz=image.sample_freq_hz,
+                                index_ticks=base_ticks,
+                                clock_adjust=args.clock_adjust,
+                                initial_clock_ticks=None,
+                                invert=inv,
+                            )
+                            score = score_candidate(bitcells)
+                            if best is None or score < best[0]:
+                                best = (score, scale, inv)
+                    if best:
+                        _, clock_scale, invert_bits = best
+                        print(
+                            f" Auto-selected clock_scale={clock_scale} invert_bits={invert_bits}"
+                        )
+
                 def decode_bits_for_hole(hole: HoleCapture) -> list[int]:
                     flux: list[int] = []
                     for rev_idx in hole.revolution_indices:
                         part = track.decode_flux(rev_idx)
                         if args.invert_flux:
                             part = list(reversed(part))
-                        if args.clock_scale != 1.0:
-                            part = [max(1, int(x * args.clock_scale)) for x in part]
+                        if clock_scale != 1.0:
+                            part = [max(1, int(x * clock_scale)) for x in part]
                         flux.extend(part)
                     return pll_decode_bits(
                         flux,
@@ -862,7 +941,7 @@ def main() -> None:
                         index_ticks=hole.index_ticks,
                         clock_adjust=args.clock_adjust,
                         initial_clock_ticks=None,
-                        invert=args.invert_bitcells,
+                        invert=invert_bits,
                     )
 
                 def iter_hole_groups():
@@ -972,7 +1051,7 @@ def main() -> None:
                             )
                             bit_offset += step_bits
                             idx += 1
-                if args.stitch_rotation:
+                if args.stitch_rotation or args.scan_bit_patterns or args.bruteforce_marks:
                     stitched_flux, stitched_ticks = stitch_rotation_flux(
                         track,
                         grouping,
@@ -983,8 +1062,8 @@ def main() -> None:
                         if args.invert_flux:
                             stitched_flux = list(reversed(stitched_flux))
                         flux_scaled = (
-                            [max(1, int(x * args.clock_scale)) for x in stitched_flux]
-                            if args.clock_scale != 1.0
+                            [max(1, int(x * clock_scale)) for x in stitched_flux]
+                            if clock_scale != 1.0
                             else stitched_flux
                         )
                         stitched_bits = pll_decode_bits(
@@ -993,7 +1072,7 @@ def main() -> None:
                             index_ticks=stitched_ticks,
                             clock_adjust=args.clock_adjust,
                             initial_clock_ticks=None,
-                            invert=args.invert_bitcells,
+                            invert=invert_bits,
                         )
                         label = "rotation0_stitched"
                         if outdir:
