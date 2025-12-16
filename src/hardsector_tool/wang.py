@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Sequence, Tuple
 
 from .fm import crc16_ibm, decode_fm_bytes, pll_decode_fm_bytes
-from .hardsector import HardSectorGrouping, HoleCapture, group_hard_sectors, pair_holes
+from .hardsector import HoleCapture, group_hard_sectors, pair_holes
 from .scp import SCPImage, TrackData
 
 

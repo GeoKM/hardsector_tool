@@ -38,8 +38,8 @@ from .hardsector import (
     pair_holes,
     stitch_rotation_flux,
 )
-from .wang import reconstruct_track, summarize_wang_map
 from .scp import RevolutionEntry, SCPHeader, SCPImage, TrackData
+from .wang import reconstruct_track, summarize_wang_map
 
 __all__ = [
     "__version__",

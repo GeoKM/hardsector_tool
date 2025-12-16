@@ -37,7 +37,6 @@ from hardsector_tool.hardsector import (
     decode_hole_bytes,
     decode_track_best_map,
     group_hard_sectors,
-    pair_holes,
     payload_metrics,
     stitch_rotation_flux,
 )
