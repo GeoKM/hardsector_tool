@@ -471,7 +471,10 @@ def main() -> None:
                 short_pair = grouping.short_pair_positions[0]
                 for idx, ticks in enumerate(durations):
                     marker = ""
-                    if short_pair is not None and idx in {short_pair, (short_pair + 1) % len(durations)}:
+                    if short_pair is not None and idx in {
+                        short_pair,
+                        (short_pair + 1) % len(durations),
+                    }:
                         marker = "*"
                     labels.append(f"{idx:02d}:{ticks}{marker}")
                 print(
@@ -899,7 +902,9 @@ def main() -> None:
                     )
                     base_flux = stitched_flux if stitched_flux else track.decode_flux(0)
                     base_ticks = (
-                        stitched_ticks if stitched_ticks else track.revolutions[0].index_ticks
+                        stitched_ticks
+                        if stitched_ticks
+                        else track.revolutions[0].index_ticks
                     )
                     best = None
                     for inv in (False, True):
@@ -1051,7 +1056,11 @@ def main() -> None:
                             )
                             bit_offset += step_bits
                             idx += 1
-                if args.stitch_rotation or args.scan_bit_patterns or args.bruteforce_marks:
+                if (
+                    args.stitch_rotation
+                    or args.scan_bit_patterns
+                    or args.bruteforce_marks
+                ):
                     stitched_flux, stitched_ticks = stitch_rotation_flux(
                         track,
                         grouping,

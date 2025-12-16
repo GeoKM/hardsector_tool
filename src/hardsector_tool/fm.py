@@ -144,7 +144,9 @@ def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
         c1, c2 = _kmeans_1d(logs)
         half_med, full_med = sorted((math.exp(c1), math.exp(c2)))
 
-    threshold = (half_med + full_med) / 2.0 if half_med and full_med else float(values[0])
+    threshold = (
+        (half_med + full_med) / 2.0 if half_med and full_med else float(values[0])
+    )
     return half_med, full_med, threshold
 
 
