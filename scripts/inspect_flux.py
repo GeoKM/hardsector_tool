@@ -37,10 +37,12 @@ from hardsector_tool.hardsector import (
     decode_hole_bytes,
     decode_track_best_map,
     group_hard_sectors,
+    pair_holes,
     payload_metrics,
     stitch_rotation_flux,
 )
 from hardsector_tool.scp import SCPImage
+from hardsector_tool.wang import reconstruct_track, summarize_wang_map
 
 
 def ticks_to_us(ticks: int, sample_freq_hz: int) -> float:
@@ -351,6 +353,11 @@ def main() -> None:
         help="Bytes to consider when scoring grid candidates (default 4096).",
     )
     parser.add_argument(
+        "--wang-decode",
+        action="store_true",
+        help="Run Wang/OIS HS32 pairing, voting, and checksum sweep.",
+    )
+    parser.add_argument(
         "--show-hole-timing",
         action="store_true",
         help="Print normalized hole timings and highlight short index-split pair.",
@@ -374,6 +381,13 @@ def main() -> None:
         args.expected_sectors = preset["expected_sectors"]
         args.sector_size = preset["sector_size"]
         args.encoding = preset["encoding"]
+        if "physical_sectors" in preset:
+            args.physical_sectors = preset["physical_sectors"]
+        if "logical_sectors" in preset:
+            args.logical_sectors = preset["logical_sectors"]
+        if args.preset.startswith("wang-ois"):
+            args.pair_holes = True
+            args.wang_decode = True
 
     args.pair_holes = args.pair_holes or args.merge_hole_pairs
     if args.pair_holes:
@@ -549,10 +563,11 @@ def main() -> None:
         preview = result.bytes_out[:64]
         hex_preview = " ".join(f"{b:02x}" for b in preview)
         print(
-            "\nFM decode (track {t}, rev 0, {method}):\n"
+            "\nFM decode (track {t}, rev {rev}, {method}):\n"
             " {meta}, bit shift {shift}\n"
             " first 64 bytes: {preview}".format(
                 t=target_track,
+                rev=rev_index,
                 method=getattr(result, "method", ""),  # type: ignore[arg-type]
                 meta=meta,
                 shift=result.bit_shift,
@@ -1135,6 +1150,30 @@ def main() -> None:
                 f"  {label}: size={size} fill={fill_ratio:.3f} entropy={entropy:.2f} "
                 f"first16={preview[:16].hex()}"
             )
+
+    if args.wang_decode:
+        candidates = tracks_for_bulk() or tracks
+        if not candidates:
+            print("\nNo tracks selected for Wang/OIS decoding.")
+        else:
+            print("\nWang/OIS HS32 reconstruction:")
+            for t in candidates:
+                best_map: dict[int, object] | None = None
+                best_len = -1
+                for phase in (0, 1):
+                    wang_map = reconstruct_track(
+                        image,
+                        t,
+                        sector_size=args.sector_size,
+                        logical_sectors=args.logical_sectors,
+                        pair_phase=phase,
+                        clock_adjust=args.clock_adjust,
+                    )
+                    if len(wang_map) > best_len:
+                        best_len = len(wang_map)
+                        best_map = wang_map
+                summary = summarize_wang_map(best_map or {})
+                print(f" Track {t}: {summary}")
 
 
 if __name__ == "__main__":

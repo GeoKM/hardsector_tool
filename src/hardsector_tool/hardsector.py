@@ -33,6 +33,7 @@ class HoleCapture:
     revolution_indices: tuple[int, ...]
     index_ticks: int
     flux_count: int
+    logical_sector_index: Optional[int] = None
 
     @property
     def revolution_index(self) -> int:
@@ -62,6 +63,13 @@ FORMAT_PRESETS = {
     "cpm-16x256": {"expected_sectors": 16, "sector_size": 256, "encoding": "fm"},
     "cpm-26x128": {"expected_sectors": 26, "sector_size": 128, "encoding": "fm"},
     "ibm-9x512-mfm": {"expected_sectors": 9, "sector_size": 512, "encoding": "mfm"},
+    "wang-ois-hs32-fm-16x256": {
+        "expected_sectors": 16,
+        "sector_size": 256,
+        "encoding": "fm",
+        "logical_sectors": 16,
+        "physical_sectors": 32,
+    },
 }
 
 FILL_BYTES = {0xFF, 0xFE, 0xFB, 0xF7, 0xEF, 0xDF, 0xFD, 0xBF, 0x7F}
@@ -130,54 +138,100 @@ def _rotate_list(values: Sequence, offset: int) -> list:
     return list(values[adj:] + values[:adj])
 
 
-def _merge_index_splits(
-    revs: Sequence[RevolutionEntry], ordered_indices: Sequence[int]
-) -> tuple[list[tuple[tuple[int, ...], int, int]], Optional[int]]:
+def normalize_rotation(
+    hole_captures: Sequence[HoleCapture],
+) -> Tuple[List[HoleCapture], Optional[int]]:
     """
-    Merge the two shortest, adjacent holes (index split) into one interval.
+    Merge the index split in a 33-hole capture into 32 uniform intervals.
 
-    Returns (merged_entries, short_pair_start) where merged_entries is a list of
-    tuples: (revolution_indices, combined_index_ticks, combined_flux_count).
-    If no adjacent minimum pair is found, the original ordering is preserved and
-    short_pair_start is None.
+    The Wang HS32 captures show one short+short adjacent pair caused by the
+    index pulse splitting a hard-sector window. We detect candidates shorter
+    than 75% of the median interval, locate the adjacent pair among them, and
+    return a new list with the pair merged (flux concatenated, ticks summed).
     """
 
-    if len(revs) < 3:
-        merged = [
-            ((ordered_indices[i],), revs[i].index_ticks, revs[i].flux_count)
-            for i in range(len(revs))
-        ]
-        return merged, None
+    if len(hole_captures) < 3:
+        return list(hole_captures), None
 
-    med = median(r.index_ticks for r in revs)
-    cutoff = med * 0.7 if med else 0
-    candidates: list[tuple[int, int]] = []
-    for idx, rev in enumerate(revs):
-        nxt = (idx + 1) % len(revs)
-        if rev.index_ticks < cutoff and revs[nxt].index_ticks < cutoff:
-            candidates.append((rev.index_ticks + revs[nxt].index_ticks, idx))
+    med = median(h.index_ticks for h in hole_captures)
+    cutoff = med * 0.75 if med else 0
+    short_indices = [
+        idx for idx, h in enumerate(hole_captures) if h.index_ticks < cutoff
+    ]
 
-    short_pair_start = min(candidates)[1] if candidates else None
-    merged: list[tuple[tuple[int, ...], int, int]] = []
-    visited: set[int] = set()
+    def find_adjacent_pair() -> Optional[int]:
+        best: tuple[int, int] | None = None
+        for idx in short_indices:
+            nxt = (idx + 1) % len(hole_captures)
+            if nxt not in short_indices:
+                continue
+            combined = hole_captures[idx].index_ticks + hole_captures[nxt].index_ticks
+            if best is None or combined < best[0]:
+                best = (combined, idx)
+        return best[1] if best else None
 
-    for idx in range(len(revs)):
-        if idx in visited:
+    short_pair_start = find_adjacent_pair()
+    merged: List[HoleCapture] = []
+    skip: set[int] = set()
+    for idx, hole in enumerate(hole_captures):
+        if idx in skip:
             continue
         if short_pair_start is not None and idx == short_pair_start:
-            partner = (idx + 1) % len(revs)
-            indices = (ordered_indices[idx], ordered_indices[partner])
-            merged_ticks = revs[idx].index_ticks + revs[partner].index_ticks
-            merged_flux = revs[idx].flux_count + revs[partner].flux_count
-            merged.append((indices, merged_ticks, merged_flux))
-            visited.update({idx, partner})
+            partner = (idx + 1) % len(hole_captures)
+            partner_hole = hole_captures[partner]
+            combined_flux_count = hole.flux_count + partner_hole.flux_count
+            combined_ticks = hole.index_ticks + partner_hole.index_ticks
+            combined_indices = hole.revolution_indices + partner_hole.revolution_indices
+            merged.append(
+                HoleCapture(
+                    hole_index=len(merged),
+                    revolution_indices=combined_indices,
+                    index_ticks=combined_ticks,
+                    flux_count=combined_flux_count,
+                )
+            )
+            skip.add(partner)
             continue
         merged.append(
-            ((ordered_indices[idx],), revs[idx].index_ticks, revs[idx].flux_count)
+            HoleCapture(
+                hole_index=len(merged),
+                revolution_indices=hole.revolution_indices,
+                index_ticks=hole.index_ticks,
+                flux_count=hole.flux_count,
+            )
         )
-        visited.add(idx)
 
     return merged, short_pair_start
+
+
+def pair_holes(holes: Sequence[HoleCapture], phase: int = 0) -> List[HoleCapture]:
+    """
+    Combine adjacent holes into logical sectors (two holes per logical sector).
+
+    The `phase` argument controls pairing start: phase=0 pairs (0,1),(2,3)...;
+    phase=1 pairs (1,2),(3,4)... with wraparound.
+    """
+
+    if not holes:
+        return []
+
+    paired: List[HoleCapture] = []
+    count = len(holes)
+    for pair_idx in range(count // 2):
+        first = (pair_idx * 2 + phase) % count
+        second = (first + 1) % count
+        h0 = holes[first]
+        h1 = holes[second]
+        paired.append(
+            HoleCapture(
+                hole_index=pair_idx,
+                revolution_indices=h0.revolution_indices + h1.revolution_indices,
+                index_ticks=h0.index_ticks + h1.index_ticks,
+                flux_count=h0.flux_count + h1.flux_count,
+                logical_sector_index=pair_idx,
+            )
+        )
+    return paired
 
 
 def group_hard_sectors(
@@ -218,18 +272,18 @@ def group_hard_sectors(
             chunk = _rotate_list(chunk, offset)
             chunk_indices = _rotate_list(chunk_indices, offset)
 
-        merged, short_pair = _merge_index_splits(chunk, chunk_indices)
-        short_pairs.append(short_pair)
         captures: List[HoleCapture] = []
-        for idx, (rev_indices, ticks, flux_count) in enumerate(merged):
+        for idx, rev in enumerate(chunk):
             captures.append(
                 HoleCapture(
                     hole_index=idx,
-                    revolution_indices=tuple(rev_indices),
-                    index_ticks=ticks,
-                    flux_count=flux_count,
+                    revolution_indices=(chunk_indices[idx],),
+                    index_ticks=rev.index_ticks,
+                    flux_count=rev.flux_count,
                 )
             )
+        captures, short_pair = normalize_rotation(captures)
+        short_pairs.append(short_pair)
         groups.append(captures)
     return HardSectorGrouping(
         groups=groups,

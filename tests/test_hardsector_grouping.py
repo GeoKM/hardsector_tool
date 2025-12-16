@@ -5,6 +5,7 @@ from hardsector_tool.hardsector import (
     best_sector_map,
     build_raw_image,
     group_hard_sectors,
+    pair_holes,
 )
 from hardsector_tool.scp import RevolutionEntry, SCPImage, TrackData
 
@@ -23,6 +24,18 @@ def test_grouping_matches_expected_rotations() -> None:
     assert len(grouping.groups[0]) == 32
     assert grouping.groups[0][0].hole_index == 0
     assert sum(len(h.revolution_indices) for h in grouping.groups[0]) == 33
+
+
+def test_grouping_pairs_holes_into_logical_sectors() -> None:
+    image = SCPImage.from_file(FIXTURE)
+    track = image.read_track(0)
+    assert track is not None
+
+    grouping = group_hard_sectors(track, sectors_per_rotation=32)
+    paired = pair_holes(grouping.groups[0])
+    assert len(paired) == 16
+    assert all(h.logical_sector_index == idx for idx, h in enumerate(paired))
+    assert sum(len(h.revolution_indices) for h in paired) == 33
 
 
 def test_detects_short_pair_position() -> None:

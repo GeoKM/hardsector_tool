@@ -35,8 +35,10 @@ from .hardsector import (
     compute_flux_index_diagnostics,
     decode_hole,
     group_hard_sectors,
+    pair_holes,
     stitch_rotation_flux,
 )
+from .wang import reconstruct_track, summarize_wang_map
 from .scp import RevolutionEntry, SCPHeader, SCPImage, TrackData
 
 __all__ = [
@@ -66,6 +68,7 @@ __all__ = [
     "SectorGuess",
     "HardSectorGrouping",
     "HoleCapture",
+    "pair_holes",
     "group_hard_sectors",
     "decode_hole",
     "best_sector_map",
@@ -73,6 +76,8 @@ __all__ = [
     "compute_flux_index_diagnostics",
     "compute_flux_index_deltas",
     "stitch_rotation_flux",
+    "reconstruct_track",
+    "summarize_wang_map",
 ]
 
 __version__ = "0.0.1"
