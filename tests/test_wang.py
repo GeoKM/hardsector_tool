@@ -17,7 +17,7 @@ def test_wang_scan_frame_detects_headers() -> None:
     paired = pair_holes(grouping.groups[0])
     assert len(paired) == 16
 
-    reconstructed = reconstruct_track(
+    reconstructed, _, _ = reconstruct_track(
         image,
         0,
         sector_size=256,
