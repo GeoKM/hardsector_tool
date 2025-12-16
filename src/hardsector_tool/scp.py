@@ -168,6 +168,17 @@ class SCPImage:
                 )
             )
 
+        offsets = [rev.data_offset for rev in revs]
+        if offsets != sorted(offsets):
+            raise ValueError(
+                f"Track {track_number} revolution offsets not monotonically increasing"
+            )
+        min_expected_offset = header_len
+        if offsets[0] < min_expected_offset:
+            raise ValueError(
+                f"Track {track_number} offset {offsets[0]} precedes track data header"
+            )
+
         first_offset = revs[0].data_offset
         last_rev = revs[-1]
         flux_start = track_offset + first_offset

@@ -37,3 +37,13 @@ def test_track_zero_flux_round_trip(scp_image: SCPImage) -> None:
     total_ticks = sum(flux)
     tolerance = int(rev0.index_ticks * 0.1)
     assert abs(total_ticks - rev0.index_ticks) <= tolerance
+
+
+def test_track_offsets_and_flux_words(scp_image: SCPImage) -> None:
+    track = scp_image.read_track(0)
+    assert track is not None
+    assert len(track.revolutions) == 198
+    assert track.revolutions[0].data_offset == 2380
+    # First few decoded flux words should be non-zero and below 16-bit carry limits
+    flux_words = track.decode_flux(0)[:8]
+    assert all(0 < word < 65535 for word in flux_words)
