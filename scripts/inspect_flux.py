@@ -227,6 +227,11 @@ def main() -> None:
         help="Invert PLL bitcells before byte conversion (useful if polarity is reversed).",
     )
     parser.add_argument(
+        "--merge-hole-pairs",
+        action="store_true",
+        help="Concatenate consecutive hole bitstreams (0+1, 2+3, ...) before scanning/dumping.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -540,14 +545,15 @@ def main() -> None:
                 if not grouping.groups:
                     continue
                 first_rot = grouping.groups[0]
-                for hole in first_rot:
+
+                def decode_bits_for_hole(hole) -> list[int]:
                     flux = track.decode_flux(hole.revolution_index)
                     flux_scaled = (
                         [max(1, int(x * args.clock_scale)) for x in flux]
                         if args.clock_scale != 1.0
                         else flux
                     )
-                    bits = pll_decode_bits(
+                    return pll_decode_bits(
                         flux_scaled,
                         sample_freq_hz=image.sample_freq_hz,
                         index_ticks=hole.index_ticks,
@@ -555,14 +561,33 @@ def main() -> None:
                         initial_clock_ticks=None,
                         invert=args.invert_bitcells,
                     )
+
+                hole_iterable = (
+                    [(first_rot[i], first_rot[i + 1]) for i in range(0, len(first_rot) - 1, 2)]
+                    if args.merge_hole_pairs
+                    else [(h,) for h in first_rot]
+                )
+
+                for entry in hole_iterable:
+                    if len(entry) == 2:
+                        h_a, h_b = entry
+                        bits_a = decode_bits_for_hole(h_a)
+                        bits_b = decode_bits_for_hole(h_b)
+                        bits = bits_a + bits_b
+                        label = f"hole{h_a.hole_index:02d}-{h_b.hole_index:02d}"
+                    else:
+                        hole = entry[0]
+                        bits = decode_bits_for_hole(hole)
+                        label = f"hole{hole.hole_index:02d}"
+
                     if outdir:
-                        fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bits"
+                        fname = outdir / f"track{t:03d}_{label}.bits"
                         fname.write_bytes(bytes(bits))
                     if args.scan_bit_patterns:
                         hits = scan_bit_patterns(bits)
                         if hits:
                             print(
-                                f"Track {t} hole {hole.hole_index}: bit-pattern hits "
+                                f"Track {t} {label}: bit-pattern hits "
                                 f"(shift,byte,val): {hits[:10]}"
                             )
                     if args.bruteforce_marks:
@@ -573,19 +598,19 @@ def main() -> None:
                             first = payloads[0]
                             preview = " ".join(f"{b:02x}" for b in first[3][:16])
                             print(
-                                f"Track {t} hole {hole.hole_index}: {len(payloads)} mark payloads; "
+                                f"Track {t} {label}: {len(payloads)} mark payloads; "
                                 f"first (shift {first[0]}, off {first[1]}, val {first[2]:02x}) {preview}"
                             )
                             if payload_dir:
                                 for idx, (shift, off, val, payload) in enumerate(payloads[:payload_cap]):
                                     fname = payload_dir / (
-                                        f"track{t:03d}_hole{hole.hole_index:02d}_"
+                                        f"track{t:03d}_{label}_"
                                         f"shift{shift}_off{off:05d}_val{val:02x}.bin"
                                     )
                                     fname.write_bytes(payload)
                                 if len(payloads) > payload_cap:
                                     print(
-                                        f"  ...truncated payload dumps at {payload_cap} per hole for {payload_dir}"
+                                        f"  ...truncated payload dumps at {payload_cap} entries for {payload_dir}"
                                     )
             if outdir:
                 print(f"\nWrote bitcell dumps to {outdir}")
