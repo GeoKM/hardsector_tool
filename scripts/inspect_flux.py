@@ -9,12 +9,14 @@ Example:
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import (
     brute_force_mark_payloads,
+    bits_to_bytes,
     decode_fm_bytes,
     decode_mfm_bytes,
     pll_decode_fm_bytes,
@@ -42,6 +44,24 @@ def ticks_to_us(ticks: int, sample_freq_hz: int) -> float:
 
 def fmt_tick_span(ticks: int, sample_freq_hz: int) -> str:
     return f"{ticks_to_us(ticks, sample_freq_hz):.2f} us"
+
+
+FILL_BYTES = {0xFF, 0xFE, 0xFB, 0xF7, 0xEF, 0xDF, 0xFD, 0xBF, 0x7F}
+
+
+def payload_metrics(data: bytes) -> tuple[float, float]:
+    if not data:
+        return 1.0, 0.0
+    fill_ratio = sum(1 for b in data if b in FILL_BYTES) / len(data)
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    entropy = 0.0
+    for count in freq:
+        if count:
+            p = count / len(data)
+            entropy -= p * math.log2(p)
+    return fill_ratio, entropy
 
 
 def describe_flux(flux: list[int], sample_freq_hz: int) -> str:
@@ -232,6 +252,28 @@ def main() -> None:
         help="Concatenate consecutive hole bitstreams (0+1, 2+3, ...) before scanning/dumping.",
     )
     parser.add_argument(
+        "--fixed-spacing-scan",
+        action="store_true",
+        help="When merging hole pairs, also slice fixed-size windows (mark-free) for inspection.",
+    )
+    parser.add_argument(
+        "--fixed-spacing-bytes",
+        type=int,
+        default=258,
+        help="Window size for fixed-spacing-scan (default 258 for 256+CRC).",
+    )
+    parser.add_argument(
+        "--fixed-spacing-step",
+        type=int,
+        default=2048,
+        help="Bit step between fixed windows when scanning merged hole pairs (approx FM sector length in bits).",
+    )
+    parser.add_argument(
+        "--report-entropy",
+        action="store_true",
+        help="Report top payload windows by lowest fill-ratio/highest entropy (mark and fixed-spacing payloads).",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -290,6 +332,17 @@ def main() -> None:
         if args.tracks:
             return [t for t in args.tracks if t in present_tracks]
         return list(present_tracks)
+
+    top_payloads: list[tuple[float, float, int, str, bytes]] = []
+
+    def record_payload(label: str, data: bytes) -> None:
+        if not args.report_entropy:
+            return
+        fill_ratio, entropy = payload_metrics(data)
+        top_payloads.append((fill_ratio, -entropy, len(data), label, data[:32]))
+        top_payloads.sort()
+        if len(top_payloads) > 12:
+            del top_payloads[12:]
 
     default_tracks = [present_tracks[0]] if present_tracks else []
     tracks = args.tracks or default_tracks
@@ -526,6 +579,8 @@ def main() -> None:
             print(f"\nWrote hole dumps to {outdir}")
 
     needs_bitcells = bool(args.dump_bitcells or args.scan_bit_patterns or args.bruteforce_marks)
+    if args.fixed_spacing_scan:
+        needs_bitcells = True
     if needs_bitcells:
         if not bulk_tracks:
             print("\nNo tracks selected for bitcell scans.")
@@ -608,14 +663,47 @@ def main() -> None:
                                         f"shift{shift}_off{off:05d}_val{val:02x}.bin"
                                     )
                                     fname.write_bytes(payload)
+                                    record_payload(
+                                        f"{t}:{label}:mark_shift{shift}_off{off}", payload
+                                    )
                                 if len(payloads) > payload_cap:
                                     print(
                                         f"  ...truncated payload dumps at {payload_cap} entries for {payload_dir}"
                                     )
+                            else:
+                                for shift, off, val, payload in payloads[:payload_cap]:
+                                    record_payload(
+                                        f"{t}:{label}:mark_shift{shift}_off{off}", payload
+                                    )
+                    if args.fixed_spacing_scan and len(entry) == 2 and payload_dir:
+                        step_bits = args.fixed_spacing_step
+                        window_bits = args.fixed_spacing_bytes * 8
+                        h_a, h_b = entry
+                        bit_offset = 0
+                        idx = 0
+                        while bit_offset + window_bits <= len(bits):
+                            window = bits_to_bytes(bits[bit_offset : bit_offset + window_bits])
+                            fname = payload_dir / (
+                                f"track{t:03d}_{label}_fixed{idx:03d}_"
+                                f"off{bit_offset:05d}_len{len(window):03d}.bin"
+                            )
+                            fname.write_bytes(window)
+                            record_payload(f"{t}:{label}:fixed{idx}_off{bit_offset}", window)
+                            bit_offset += step_bits
+                            idx += 1
             if outdir:
                 print(f"\nWrote bitcell dumps to {outdir}")
             if payload_dir:
                 print(f"Wrote mark payload windows to {payload_dir}")
+
+    if args.report_entropy and top_payloads:
+        print("\nTop payload windows (lowest fill ratio, highest entropy):")
+        for fill_ratio, neg_entropy, size, label, preview in top_payloads:
+            entropy = -neg_entropy
+            print(
+                f"  {label}: size={size} fill={fill_ratio:.3f} entropy={entropy:.2f} "
+                f"first16={preview[:16].hex()}"
+            )
 
 
 if __name__ == "__main__":
