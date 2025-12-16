@@ -274,6 +274,17 @@ def main() -> None:
         help="Report top payload windows by lowest fill-ratio/highest entropy (mark and fixed-spacing payloads).",
     )
     parser.add_argument(
+        "--strict-marks",
+        action="store_true",
+        help="Limit mark scans to FE/FB only (reduces false positives).",
+    )
+    parser.add_argument(
+        "--bruteforce-step-bits",
+        type=int,
+        default=2048,
+        help="When bruteforcing mark payloads without hits, try windows every N bits (default 2048).",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -646,9 +657,21 @@ def main() -> None:
                                 f"(shift,byte,val): {hits[:10]}"
                             )
                     if args.bruteforce_marks:
+                        patterns = (0xFE, 0xFB) if args.strict_marks else (0xFB, 0xFA, 0xA1, 0xFE)
                         payloads = brute_force_mark_payloads(
-                            bits, payload_bytes=args.mark_payload_bytes
+                            bits, payload_bytes=args.mark_payload_bytes, patterns=patterns
                         )
+                        if not payloads and payload_dir and args.bruteforce_step_bits:
+                            # Fallback: brute-force fixed windows even without mark hits.
+                            step_bits = args.bruteforce_step_bits
+                            window_bits = args.mark_payload_bytes * 8
+                            bit_offset = 0
+                            idx = 0
+                            while bit_offset + window_bits <= len(bits):
+                                payload = bits_to_bytes(bits[bit_offset : bit_offset + window_bits])
+                                payloads.append((0, bit_offset // 8, 0x00, payload))
+                                bit_offset += step_bits
+                                idx += 1
                         if payloads:
                             first = payloads[0]
                             preview = " ".join(f"{b:02x}" for b in first[3][:16])

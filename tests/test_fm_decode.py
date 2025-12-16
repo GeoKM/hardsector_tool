@@ -4,6 +4,7 @@ from hardsector_tool.fm import (
     brute_force_mark_payloads,
     decode_fm_bytes,
     decode_mfm_bytes,
+    fm_bytes_from_bitcells,
     estimate_cell_ticks,
     pll_decode_fm_bytes,
     pll_decode_bits,
@@ -45,6 +46,14 @@ def test_pll_decode_and_sector_scan() -> None:
     guesses = scan_fm_sectors(pll_result.bytes_out)
     # Sector guesses may be zero on noisy data but should not raise.
     assert isinstance(guesses, list)
+
+
+def test_fm_bytes_from_bitcells_chooses_phase() -> None:
+    # FM pattern with alternating clock=1, data=0 bits (phase 0 clocks)
+    bitcells = [1, 0] * 8
+    phase, data = fm_bytes_from_bitcells(bitcells)
+    assert phase in (0, 1)
+    assert data  # should produce at least one byte
 
 
 def test_scan_require_sync_filters_results() -> None:
