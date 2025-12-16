@@ -1,10 +1,12 @@
 from pathlib import Path
 
 from hardsector_tool.fm import (
+    brute_force_mark_payloads,
     decode_fm_bytes,
     decode_mfm_bytes,
     estimate_cell_ticks,
     pll_decode_fm_bytes,
+    pll_decode_bits,
     scan_fm_sectors,
     mfm_bytes_from_bitcells,
 )
@@ -78,3 +80,27 @@ def test_mfm_bitcell_roundtrip() -> None:
     shift, decoded = mfm_bytes_from_bitcells(bitcells)
     # Expect to recover the original bytes regardless of offset (shift may be 0)
     assert decoded[:2] == bytes([0xA1, 0x4E])
+
+
+def test_pll_decode_bit_inversion() -> None:
+    # A tiny flux stream should produce a bit, and inversion should flip it.
+    bits = pll_decode_bits([10], sample_freq_hz=10)
+    inverted = pll_decode_bits([10], sample_freq_hz=10, invert=True)
+    assert bits and inverted
+    assert inverted[0] != bits[0]
+
+
+def test_bruteforce_mark_payloads_extracts_window() -> None:
+    def bytes_to_bits(data: bytes) -> list[int]:
+        bits: list[int] = []
+        for b in data:
+            for i in range(8):
+                bits.append((b >> (7 - i)) & 1)
+        return bits
+
+    bits = [0, 0, 0] + bytes_to_bits(bytes([0xFE, 0x11, 0x22, 0x33]))
+    payloads = brute_force_mark_payloads(bits, payload_bytes=2, patterns=(0xFE,))
+    assert payloads
+    shift, offset, val, payload = payloads[0]
+    assert (shift, offset, val) == (3, 0, 0xFE)
+    assert payload.startswith(bytes([0xFE, 0x11]))

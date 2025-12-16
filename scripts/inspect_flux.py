@@ -14,11 +14,13 @@ from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import (
+    brute_force_mark_payloads,
     decode_fm_bytes,
     decode_mfm_bytes,
     pll_decode_fm_bytes,
     pll_decode_bits,
     scan_data_marks,
+    scan_bit_patterns,
     scan_fm_sectors,
 )
 from hardsector_tool.hardsector import (
@@ -165,6 +167,12 @@ def main() -> None:
         help="PLL clock adjustment range (fraction, default 0.10).",
     )
     parser.add_argument(
+        "--clock-scale",
+        type=float,
+        default=1.0,
+        help="Scale estimated clock ticks (e.g., 0.5 or 2.0) before PLL.",
+    )
+    parser.add_argument(
         "--synthetic-from-holes",
         action="store_true",
         help="If no IDAMs are found, synthesize sectors from hole payloads (mod expected sector count).",
@@ -173,13 +181,13 @@ def main() -> None:
         "--dump-holes",
         type=Path,
         default=None,
-        help="Directory to dump raw decoded bytes per hole (first rotation of each track in image-out range).",
+        help="Directory to dump raw decoded bytes per hole (first rotation of each selected track).",
     )
     parser.add_argument(
         "--dump-bitcells",
         type=Path,
         default=None,
-        help="Directory to dump PLL bitcells per hole (first rotation of each track in image-out range).",
+        help="Directory to dump PLL bitcells per hole (first rotation of each selected track).",
     )
     parser.add_argument(
         "--scan-marks",
@@ -187,9 +195,36 @@ def main() -> None:
         help="Scan decoded bytes for data marks (0xFB/0xFA) without CRC.",
     )
     parser.add_argument(
+        "--scan-bit-patterns",
+        action="store_true",
+        help="Scan bitcell streams for mark bytes across bit shifts (0xFB/0xFA/0xA1/0xFE).",
+    )
+    parser.add_argument(
+        "--bruteforce-marks",
+        action="store_true",
+        help="Extract payload windows following mark hits in bitcell streams.",
+    )
+    parser.add_argument(
+        "--mark-payload-bytes",
+        type=int,
+        default=256,
+        help="Bytes to capture after each mark when bruteforcing (default 256).",
+    )
+    parser.add_argument(
+        "--mark-payload-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to dump bruteforced mark payloads (implies --bruteforce-marks).",
+    )
+    parser.add_argument(
         "--invert-bytes",
         action="store_true",
         help="Invert decoded bytes (bitwise NOT) when dumping holes and scanning marks.",
+    )
+    parser.add_argument(
+        "--invert-bitcells",
+        action="store_true",
+        help="Invert PLL bitcells before byte conversion (useful if polarity is reversed).",
     )
     parser.add_argument(
         "--write-sectors",
@@ -215,6 +250,8 @@ def main() -> None:
         help="Require an 0xA1 sync byte before IDAM when scanning sectors.",
     )
     args = parser.parse_args()
+    if args.mark_payload_dir:
+        args.bruteforce_marks = True
 
     if args.preset != "auto":
         preset = FORMAT_PRESETS[args.preset]
@@ -225,6 +262,30 @@ def main() -> None:
     image = SCPImage.from_file(args.scp_path)
     hdr = image.header
     present_tracks = hdr.non_empty_tracks
+
+    def expand_track_range(range_arg: str | None) -> list[int]:
+        selected: list[int] = []
+        if not range_arg:
+            return selected
+        for part in range_arg.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if "-" in token:
+                start, end = token.split("-", 1)
+                selected.extend(range(int(start), int(end) + 1))
+            else:
+                selected.append(int(token))
+        return selected
+
+    def tracks_for_bulk() -> list[int]:
+        if args.track_range:
+            chosen = expand_track_range(args.track_range)
+            return [t for t in chosen if t in present_tracks]
+        if args.tracks:
+            return [t for t in args.tracks if t in present_tracks]
+        return list(present_tracks)
+
     default_tracks = [present_tracks[0]] if present_tracks else []
     tracks = args.tracks or default_tracks
 
@@ -395,50 +456,47 @@ def main() -> None:
                         fname.write_bytes(g.data)
                         print(f"  wrote {fname} ({len(g.data)} bytes)")
 
-    # Whole-disk pass: assemble best sector maps across all present tracks.
+    bulk_tracks = tracks_for_bulk()
+
+    # Whole-disk pass: assemble best sector maps across selected tracks.
     if args.image_out:
-        if args.track_range:
-            selected = []
-            for part in args.track_range.split(","):
-                if "-" in part:
-                    start, end = part.split("-", 1)
-                    selected.extend(range(int(start), int(end) + 1))
-                else:
-                    selected.append(int(part))
-            track_list = [t for t in selected if t in present_tracks]
+        if not bulk_tracks:
+            print("\nNo tracks selected for image output.")
         else:
-            track_list = list(present_tracks)
-        track_maps = {}
-        for t in track_list:
-            best_map = decode_track_best_map(
-                image,
-                t,
-                sectors_per_rotation=32,
+            track_maps = {}
+            for t in bulk_tracks:
+                best_map = decode_track_best_map(
+                    image,
+                    t,
+                    sectors_per_rotation=32,
+                    expected_sectors=args.expected_sectors,
+                    expected_size=args.sector_size,
+                    encoding=args.encoding,
+                    use_pll=args.use_pll,
+                    require_sync=args.require_sync,
+                    calibrate_rotation=args.calibrate_rotation,
+                    synthetic_from_holes=args.synthetic_from_holes,
+                    clock_adjust=args.clock_adjust,
+                )
+                track_maps[t] = best_map
+            raw = build_raw_image(
+                track_maps,
+                track_order=bulk_tracks,
                 expected_sectors=args.expected_sectors,
                 expected_size=args.sector_size,
-                encoding=args.encoding,
-                use_pll=args.use_pll,
-                require_sync=args.require_sync,
-                calibrate_rotation=args.calibrate_rotation,
-                synthetic_from_holes=args.synthetic_from_holes,
-                clock_adjust=args.clock_adjust,
+                fill_byte=0x00,
             )
-            track_maps[t] = best_map
-        raw = build_raw_image(
-            track_maps,
-            track_order=track_list,
-            expected_sectors=args.expected_sectors,
-            expected_size=args.sector_size,
-            fill_byte=0x00,
-        )
-        args.image_out.parent.mkdir(parents=True, exist_ok=True)
-        args.image_out.write_bytes(raw)
-        print(f"\nWrote assembled image to {args.image_out} ({len(raw)} bytes)")
+            args.image_out.parent.mkdir(parents=True, exist_ok=True)
+            args.image_out.write_bytes(raw)
+            print(f"\nWrote assembled image to {args.image_out} ({len(raw)} bytes)")
 
-        if args.dump_holes:
+    if args.dump_holes:
+        if not bulk_tracks:
+            print("\nNo tracks selected for hole dumps.")
+        else:
             outdir = args.dump_holes
             outdir.mkdir(parents=True, exist_ok=True)
-            for t in track_list:
+            for t in bulk_tracks:
                 track = image.read_track(t)
                 if not track:
                     continue
@@ -460,12 +518,21 @@ def main() -> None:
                         data = bytes(~b & 0xFF for b in data)
                     fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bin"
                     fname.write_bytes(data)
-            print(f"Wrote hole dumps to {outdir}")
+            print(f"\nWrote hole dumps to {outdir}")
 
-        if args.dump_bitcells:
+    needs_bitcells = bool(args.dump_bitcells or args.scan_bit_patterns or args.bruteforce_marks)
+    if needs_bitcells:
+        if not bulk_tracks:
+            print("\nNo tracks selected for bitcell scans.")
+        else:
             outdir = args.dump_bitcells
-            outdir.mkdir(parents=True, exist_ok=True)
-            for t in track_list:
+            payload_dir = args.mark_payload_dir
+            payload_cap = 128
+            if outdir:
+                outdir.mkdir(parents=True, exist_ok=True)
+            if payload_dir:
+                payload_dir.mkdir(parents=True, exist_ok=True)
+            for t in bulk_tracks:
                 track = image.read_track(t)
                 if not track:
                     continue
@@ -475,15 +542,55 @@ def main() -> None:
                 first_rot = grouping.groups[0]
                 for hole in first_rot:
                     flux = track.decode_flux(hole.revolution_index)
+                    flux_scaled = (
+                        [max(1, int(x * args.clock_scale)) for x in flux]
+                        if args.clock_scale != 1.0
+                        else flux
+                    )
                     bits = pll_decode_bits(
-                        flux,
+                        flux_scaled,
                         sample_freq_hz=image.sample_freq_hz,
                         index_ticks=hole.index_ticks,
                         clock_adjust=args.clock_adjust,
+                        initial_clock_ticks=None,
+                        invert=args.invert_bitcells,
                     )
-                    fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bits"
-                    fname.write_bytes(bytes(bits))
-            print(f"Wrote bitcell dumps to {outdir}")
+                    if outdir:
+                        fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bits"
+                        fname.write_bytes(bytes(bits))
+                    if args.scan_bit_patterns:
+                        hits = scan_bit_patterns(bits)
+                        if hits:
+                            print(
+                                f"Track {t} hole {hole.hole_index}: bit-pattern hits "
+                                f"(shift,byte,val): {hits[:10]}"
+                            )
+                    if args.bruteforce_marks:
+                        payloads = brute_force_mark_payloads(
+                            bits, payload_bytes=args.mark_payload_bytes
+                        )
+                        if payloads:
+                            first = payloads[0]
+                            preview = " ".join(f"{b:02x}" for b in first[3][:16])
+                            print(
+                                f"Track {t} hole {hole.hole_index}: {len(payloads)} mark payloads; "
+                                f"first (shift {first[0]}, off {first[1]}, val {first[2]:02x}) {preview}"
+                            )
+                            if payload_dir:
+                                for idx, (shift, off, val, payload) in enumerate(payloads[:payload_cap]):
+                                    fname = payload_dir / (
+                                        f"track{t:03d}_hole{hole.hole_index:02d}_"
+                                        f"shift{shift}_off{off:05d}_val{val:02x}.bin"
+                                    )
+                                    fname.write_bytes(payload)
+                                if len(payloads) > payload_cap:
+                                    print(
+                                        f"  ...truncated payload dumps at {payload_cap} per hole for {payload_dir}"
+                                    )
+            if outdir:
+                print(f"\nWrote bitcell dumps to {outdir}")
+            if payload_dir:
+                print(f"Wrote mark payload windows to {payload_dir}")
 
 
 if __name__ == "__main__":

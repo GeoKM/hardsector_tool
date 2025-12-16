@@ -71,6 +71,20 @@ def scan_data_marks(byte_stream: bytes, marks: Sequence[int] = (0xFB, 0xFA)) -> 
     return hits
 
 
+def scan_bit_patterns(bits: Sequence[int], patterns: Sequence[int] = (0xFB, 0xFA, 0xA1, 0xFE)) -> List[Tuple[int, int, int]]:
+    """
+    Scan bitcell stream for byte patterns across all bit shifts.
+    Returns list of (shift, byte_offset, value).
+    """
+    hits: List[Tuple[int, int, int]] = []
+    for shift in range(8):
+        as_bytes = bits_to_bytes(bits[shift:])
+        for idx, b in enumerate(as_bytes):
+            if b in patterns:
+                hits.append((shift, idx, b))
+    return hits
+
+
 def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
     """
     Estimate half and full cell durations from a flux interval distribution.
@@ -239,6 +253,7 @@ def pll_decode_bits(
     index_ticks: int | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
     initial_clock_ticks: float | None = None,
+    invert: bool = False,
 ) -> List[int]:
     """
     Decode flux intervals into bitcells using a simple PLL.
@@ -288,7 +303,7 @@ def pll_decode_bits(
         new_ticks = ticks * (1 - PLL_PHASE_ADJ)
         ticks = new_ticks
 
-    return bits
+    return [0 if b else 1 for b in bits] if invert else bits
 
 
 def pll_decode_fm_bytes(
@@ -297,6 +312,7 @@ def pll_decode_fm_bytes(
     index_ticks: int | None = None,
     initial_clock_ticks: float | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    invert: bool = False,
 ) -> PLLDecodeResult:
     bitcells = pll_decode_bits(
         flux,
@@ -304,6 +320,7 @@ def pll_decode_fm_bytes(
         index_ticks=index_ticks,
         initial_clock_ticks=initial_clock_ticks,
         clock_adjust=clock_adjust,
+        invert=invert,
     )
     shift, decoded = best_aligned_bytes(bitcells)
     half_med, _, _ = estimate_cell_ticks(flux)
@@ -314,6 +331,30 @@ def pll_decode_fm_bytes(
         initial_clock_ticks=clock_ticks,
         clock_ticks=clock_ticks,
     )
+
+
+def brute_force_mark_payloads(
+    bits: Sequence[int],
+    payload_bytes: int = 256,
+    patterns: Sequence[int] = (0xFB, 0xFA, 0xA1, 0xFE),
+) -> List[Tuple[int, int, int, bytes]]:
+    """
+    Extract payload windows following mark-like bytes across all bit shifts.
+
+    Returns a list of (shift, byte_offset, value, payload) tuples where
+    payload is payload_bytes long (or shorter at the end of the stream).
+    """
+    results: List[Tuple[int, int, int, bytes]] = []
+    for shift in range(8):
+        byte_stream = bits_to_bytes(bits[shift:])
+        for idx, val in enumerate(byte_stream):
+            if val not in patterns:
+                continue
+            start_bit = shift + idx * 8
+            end_bit = start_bit + payload_bytes * 8
+            payload = bits_to_bytes(bits[start_bit:end_bit])
+            results.append((shift, idx, val, payload))
+    return results
 
 
 def crc16_ibm(data: bytes) -> int:
