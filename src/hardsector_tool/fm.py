@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from statistics import median
 from typing import List, Optional, Sequence, Tuple
 
 DEFAULT_CLOCK_ADJ = 0.10
@@ -116,7 +115,9 @@ def _kmeans_1d(values: Sequence[float]) -> Tuple[float, float]:
                 new_centers.append(sum(cluster) / len(cluster))
             else:
                 new_centers.append(centers[idx])
-        if all(math.isclose(a, b) for a, b in zip(centers, new_centers)):
+        if all(
+            math.isclose(a, b) for a, b in zip(centers, new_centers, strict=True)
+        ):
             break
         centers = new_centers
     return tuple(sorted(centers))  # type: ignore[return-value]
