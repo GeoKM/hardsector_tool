@@ -130,9 +130,7 @@ def best_shift(ref: bytes, candidate: bytes, max_shift: int = 64) -> tuple[int, 
         if overlap <= 0:
             continue
         matches = sum(
-            1
-            for i in range(overlap)
-            if ref[ref_start + i] == candidate[cand_start + i]
+            1 for i in range(overlap) if ref[ref_start + i] == candidate[cand_start + i]
         )
         score = matches / overlap if overlap else 0.0
         if score > best[1]:
@@ -241,7 +239,9 @@ def _apply_shift(candidate: bytes, shift: int) -> tuple[int, bytes]:
     return 0, trimmed
 
 
-def consensus_with_confidence(streams: Sequence[tuple[int, bytes]]) -> tuple[bytes, list[float]]:
+def consensus_with_confidence(
+    streams: Sequence[tuple[int, bytes]],
+) -> tuple[bytes, list[float]]:
     if not streams:
         return b"", []
     max_len = max(offset + len(data) for offset, data in streams)
@@ -360,9 +360,9 @@ def _reconstruct_sector(
         rotation_similarity=rotation_similarity,
         reference_rotation=ref_idx,
         shifts=shifts,
-        mean_similarity_kept=sum(sims_to_ref[i] for i in kept) / len(kept)
-        if kept
-        else 0.0,
+        mean_similarity_kept=(
+            sum(sims_to_ref[i] for i in kept) / len(kept) if kept else 0.0
+        ),
     )
     return reconstruction.wang_sector, reconstruction
 
@@ -433,7 +433,9 @@ def reconstruct_track(
             if dump_raw:
                 base = dump_raw / f"track{track_number:03d}_sector{sid:02d}"
                 base.parent.mkdir(parents=True, exist_ok=True)
-                (base.with_suffix("_consensus.bin")).write_bytes(reconstruction.consensus)
+                (base.with_suffix("_consensus.bin")).write_bytes(
+                    reconstruction.consensus
+                )
                 (base.with_suffix("_payload.bin")).write_bytes(sector.payload)
                 conf_text = "\n".join(f"{c:.3f}" for c in reconstruction.confidence)
                 (base.with_suffix("_confidence.txt")).write_text(conf_text)
@@ -483,6 +485,8 @@ def detect_header_candidates(
         if track_number > 0 and all(v == track_number for v in values):
             track_offsets.append(offset)
         uniq = set(values)
-        if uniq.issubset(set(range(logical_sectors))) and len(uniq) >= min(4, logical_sectors):
+        if uniq.issubset(set(range(logical_sectors))) and len(uniq) >= min(
+            4, logical_sectors
+        ):
             sector_offsets.append(offset)
     return {"track": track_offsets, "sector": sector_offsets}

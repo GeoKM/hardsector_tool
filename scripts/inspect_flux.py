@@ -1221,7 +1221,8 @@ def main() -> None:
                     )
                     if header_hits.get("track") or header_hits.get("sector"):
                         track_part = (
-                            " track@" + ",".join(str(o) for o in header_hits.get("track", []))
+                            " track@"
+                            + ",".join(str(o) for o in header_hits.get("track", []))
                             if header_hits.get("track")
                             else ""
                         )
