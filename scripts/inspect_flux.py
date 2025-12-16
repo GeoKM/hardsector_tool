@@ -14,6 +14,7 @@ from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import decode_fm_bytes, pll_decode_fm_bytes, scan_fm_sectors
+from hardsector_tool.hardsector import decode_hole, group_hard_sectors
 from hardsector_tool.scp import SCPImage
 
 
@@ -90,6 +91,17 @@ def main() -> None:
         action="store_true",
         help="Scan decoded bytes for FM sector address marks.",
     )
+    parser.add_argument(
+        "--hard-sector-summary",
+        action="store_true",
+        help="Summarize hard-sector groupings (assumes 32 holes + index).",
+    )
+    parser.add_argument(
+        "--hole",
+        type=int,
+        default=None,
+        help="Decode a specific hole (revolution index) instead of the first track default.",
+    )
     args = parser.parse_args()
 
     image = SCPImage.from_file(args.scp_path)
@@ -116,12 +128,37 @@ def main() -> None:
     print("\nTrack details:")
     summarize_tracks(image, tracks, args.revs)
 
-    if args.decode_fm and tracks:
+    if args.hard_sector_summary and tracks:
         track = image.read_track(tracks[0])
+        if track is None:
+            print("\nHard-sector summary skipped: no data on track")
+        else:
+            grouping = group_hard_sectors(track, sectors_per_rotation=32)
+            print(
+                f"\nHard-sector summary (track {tracks[0]}): "
+                f"{grouping.rotations} rotations, "
+                f"{grouping.sectors_per_rotation}+{grouping.index_holes_per_rotation} holes each"
+            )
+            avg_tick = sum(r.index_ticks for r in track.revolutions) / track.revolution_count
+            print(f" Avg index ticks per hole: {avg_tick:.1f}")
+            print(" First rotation hole counts:")
+            for hole in grouping.groups[0][:5]:
+                print(
+                    f"  hole {hole.hole_index:02d}: rev {hole.revolution_index} "
+                    f"ticks={hole.index_ticks} flux_count={hole.flux_count}"
+                )
+
+    if args.decode_fm and tracks:
+        target_track = tracks[0]
+        track = image.read_track(target_track)
         if track is None:
             print("\nFM decode skipped: no data on track")
             return
-        flux = track.decode_flux(0)
+        rev_index = args.hole if args.hole is not None else 0
+        if rev_index >= track.revolution_count:
+            print(f"\nFM decode skipped: hole {rev_index} beyond available revolutions")
+            return
+        flux = track.decode_flux(rev_index)
         if args.use_pll:
             result = pll_decode_fm_bytes(
                 flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
@@ -141,7 +178,7 @@ def main() -> None:
             "\nFM decode (track {t}, rev 0, {method}):\n"
             " {meta}, bit shift {shift}\n"
             " first 64 bytes: {preview}".format(
-                t=tracks[0],
+                t=target_track,
                 method=getattr(result, \"method\", \"\"),  # type: ignore[arg-type]
                 meta=meta,
                 shift=result.bit_shift,

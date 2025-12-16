@@ -19,6 +19,7 @@ from .fm import (
     pll_decode_fm_bytes,
     scan_fm_sectors,
 )
+from .hardsector import HardSectorGrouping, HoleCapture, decode_hole, group_hard_sectors
 from .scp import SCPImage, SCPHeader, TrackData, RevolutionEntry
 
 __all__ = [
@@ -39,6 +40,10 @@ __all__ = [
     "scan_fm_sectors",
     "PLLDecodeResult",
     "SectorGuess",
+    "HardSectorGrouping",
+    "HoleCapture",
+    "group_hard_sectors",
+    "decode_hole",
 ]
 
 __version__ = "0.0.1"
