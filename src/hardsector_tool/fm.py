@@ -301,15 +301,18 @@ def best_aligned_bytes(bits: Sequence[int]) -> Tuple[int, bytes]:
     when inverted captures produce long 0x00 runs.
     """
 
-    def score_candidate(candidate: bytes) -> Tuple[int, int, float]:
-        fill_score = max(candidate.count(0x00), candidate.count(0xFF))
+    def score_candidate(candidate: bytes) -> Tuple[int, int, int, float]:
+        zero_ff = candidate.count(0x00) + candidate.count(0xFF)
         run_score = _longest_constant_run(candidate)
+        header_bonus = sum(
+            candidate.count(marker) for marker in (0xFE, 0xFB, 0xFA, 0xA1)
+        )
         entropy_score = -_entropy(candidate)
-        return fill_score, run_score, entropy_score
+        return zero_ff, run_score, header_bonus, entropy_score
 
     best_shift = 0
     best_bytes = b""
-    best_score: Tuple[int, int, float] = (-1, -1, -math.inf)
+    best_score: Tuple[int, int, int, float] = (-1, -1, -1, -math.inf)
     for shift in range(8):
         candidate = bits_to_bytes(bits[shift:])
         score = score_candidate(candidate)
@@ -428,34 +431,31 @@ def fm_bytes_from_bitcells(bitcells: Sequence[int]) -> Tuple[int, bytes]:
     """
     Convert PLL bitcells into FM data bytes.
 
-    We try both possible clock/data phases, prefer the one with denser clock
-    transitions, and then apply byte-alignment heuristics to the resulting
-    data-bit stream.
+    We try both clock/data phases, pick the clock phase with the densest
+    transitions, then align the resulting data-bit stream into bytes.
     """
 
     if not bitcells:
         return 0, b""
 
     best_phase = 0
-    best_shift = 0
-    best_bytes = b""
-    best_score: Tuple[int, float, int] = (-1, -math.inf, 0)
+    best_score = -math.inf
+    chosen_bits: Sequence[int] = ()
 
     for phase in (0, 1):
         clock_bits = bitcells[phase::2]
         data_bits = bitcells[1 - phase :: 2]
-        clock_score = sum(clock_bits)
-        shift, aligned = best_aligned_bytes(data_bits)
-        entropy = _entropy(aligned)
-        score = (clock_score, entropy, -_longest_constant_run(aligned))
-        if score > best_score:
-            best_score = score
+        if not clock_bits:
+            continue
+        clock_density = sum(clock_bits) / len(clock_bits)
+        if clock_density > best_score:
+            best_score = clock_density
             best_phase = phase
-            best_shift = shift
-            best_bytes = aligned
+            chosen_bits = data_bits
 
-    overall_shift = (1 - best_phase + best_shift) % 8
-    return overall_shift, best_bytes
+    shift, aligned = best_aligned_bytes(chosen_bits)
+    overall_shift = (1 - best_phase + shift) % 8
+    return overall_shift, aligned
 
 
 def brute_force_mark_payloads(
