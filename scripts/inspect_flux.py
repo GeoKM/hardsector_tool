@@ -13,7 +13,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
-from hardsector_tool.fm import decode_fm_bytes
+from hardsector_tool.fm import decode_fm_bytes, pll_decode_fm_bytes, scan_fm_sectors
 from hardsector_tool.scp import SCPImage
 
 
@@ -80,6 +80,16 @@ def main() -> None:
         action="store_true",
         help="Attempt FM byte decode for the first selected track/rev",
     )
+    parser.add_argument(
+        "--use-pll",
+        action="store_true",
+        help="Use PLL-based FM decode (default is heuristic).",
+    )
+    parser.add_argument(
+        "--scan-sectors",
+        action="store_true",
+        help="Scan decoded bytes for FM sector address marks.",
+    )
     args = parser.parse_args()
 
     image = SCPImage.from_file(args.scp_path)
@@ -112,22 +122,43 @@ def main() -> None:
             print("\nFM decode skipped: no data on track")
             return
         flux = track.decode_flux(0)
-        result = decode_fm_bytes(flux)
+        if args.use_pll:
+            result = pll_decode_fm_bytes(
+                flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
+            )
+            meta = f"pll clock ~{result.initial_clock_ticks:.1f} ticks"
+        else:
+            result = decode_fm_bytes(flux)
+            meta = (
+                f"half-cell ~{result.half_cell_ticks:.1f} ticks, "
+                f"full-cell ~{result.full_cell_ticks:.1f} ticks, "
+                f"threshold {result.threshold_ticks:.1f}"
+            )
+
         preview = result.bytes_out[:64]
         hex_preview = " ".join(f"{b:02x}" for b in preview)
         print(
-            "\nFM decode (track {t}, rev 0):\n"
-            " half-cell ~{hc:.1f} ticks, full-cell ~{fc:.1f} ticks, "
-            "threshold {thr:.1f}, bit shift {shift}\n"
+            "\nFM decode (track {t}, rev 0, {method}):\n"
+            " {meta}, bit shift {shift}\n"
             " first 64 bytes: {preview}".format(
                 t=tracks[0],
-                hc=result.half_cell_ticks,
-                fc=result.full_cell_ticks,
-                thr=result.threshold_ticks,
+                method=getattr(result, \"method\", \"\"),  # type: ignore[arg-type]
+                meta=meta,
                 shift=result.bit_shift,
                 preview=hex_preview,
             )
         )
+        if args.scan_sectors:
+            guesses = scan_fm_sectors(result.bytes_out)
+            if not guesses:
+                print(" No FM sectors detected")
+            else:
+                print(" Detected FM sectors (IDAM guesses):")
+                for g in guesses[:16]:
+                    print(
+                        f"  off {g.offset:06d}: C/H/S={g.track}/{g.head}/{g.sector_id} "
+                        f"size={g.length} crc_ok={g.crc_ok}"
+                    )
 
 
 if __name__ == "__main__":
