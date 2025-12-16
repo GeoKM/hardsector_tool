@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from hardsector_tool.fm import (
+    best_aligned_bytes,
     brute_force_mark_payloads,
     decode_fm_bytes,
     decode_mfm_bytes,
@@ -10,6 +11,7 @@ from hardsector_tool.fm import (
     pll_decode_bits,
     scan_fm_sectors,
     mfm_bytes_from_bitcells,
+    crc16_ibm,
 )
 from hardsector_tool.scp import SCPImage
 
@@ -31,7 +33,7 @@ def test_fm_decode_produces_bytes() -> None:
     result = decode_fm_bytes(flux)
     # Heuristic decode should produce a non-trivial byte stream.
     assert len(result.bytes_out) > 100
-    assert result.bytes_out.count(0xFF) >= 1
+    assert (result.bytes_out.count(0xFF) + result.bytes_out.count(0x00)) >= 1
 
 
 def test_pll_decode_and_sector_scan() -> None:
@@ -40,7 +42,11 @@ def test_pll_decode_and_sector_scan() -> None:
     assert track is not None
     flux = track.decode_flux(0)
 
-    pll_result = pll_decode_fm_bytes(flux, sample_freq_hz=scp.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks)
+    pll_result = pll_decode_fm_bytes(
+        flux,
+        sample_freq_hz=scp.sample_freq_hz,
+        index_ticks=track.revolutions[0].index_ticks,
+    )
     assert len(pll_result.bytes_out) > 50
 
     guesses = scan_fm_sectors(pll_result.bytes_out)
@@ -66,6 +72,28 @@ def test_scan_require_sync_filters_results() -> None:
     assert scan_fm_sectors(stream_with_sync, require_sync=False) == []
     # With sync required, it still has too few bytes to form a sector, but call should work.
     assert scan_fm_sectors(stream_with_sync, require_sync=True) == []
+
+
+def test_scan_fm_sectors_locates_dam() -> None:
+    size_code = 0
+    data = bytes([0x11] * (128 << size_code))
+    id_header = bytes([0xFE, 0x00, 0x00, 0x02, size_code])
+    id_crc = crc16_ibm(id_header)
+    data_crc = crc16_ibm(bytes([0xFB]) + data)
+    stream = (
+        b"\x00\x00\xa1"  # padding + sync
+        + id_header
+        + id_crc.to_bytes(2, "big")
+        + b"\x00\x00\x00\xa1"
+        + bytes([0xFB])
+        + data
+        + data_crc.to_bytes(2, "big")
+    )
+    guesses = scan_fm_sectors(stream, require_sync=True)
+    assert guesses
+    guess = guesses[0]
+    assert guess.data_crc_ok and guess.id_crc_ok
+    assert guess.data == data
 
 
 def test_mfm_bitcell_roundtrip() -> None:
@@ -97,6 +125,13 @@ def test_pll_decode_bit_inversion() -> None:
     inverted = pll_decode_bits([10], sample_freq_hz=10, invert=True)
     assert bits and inverted
     assert inverted[0] != bits[0]
+
+
+def test_best_aligned_bytes_prefers_zero_runs() -> None:
+    bits = [1] * 4 + [0] * 16  # sync-like nibble then zero data
+    shift, aligned = best_aligned_bytes(bits)
+    assert shift == 4
+    assert aligned.startswith(b"\x00\x00")
 
 
 def test_bruteforce_mark_payloads_extracts_window() -> None:

@@ -10,6 +10,7 @@ half cells (data 1).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from statistics import median
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -59,7 +60,9 @@ class SectorGuess:
     data: Optional[bytes] = None
 
 
-def scan_data_marks(byte_stream: bytes, marks: Sequence[int] = (0xFB, 0xFA)) -> List[Tuple[int, int]]:
+def scan_data_marks(
+    byte_stream: bytes, marks: Sequence[int] = (0xFB, 0xFA)
+) -> List[Tuple[int, int]]:
     """
     Scan for data mark bytes (e.g., 0xFB/0xFA) without CRC validation.
     Returns list of (offset, mark) pairs.
@@ -71,7 +74,9 @@ def scan_data_marks(byte_stream: bytes, marks: Sequence[int] = (0xFB, 0xFA)) -> 
     return hits
 
 
-def scan_bit_patterns(bits: Sequence[int], patterns: Sequence[int] = (0xFB, 0xFA, 0xA1, 0xFE)) -> List[Tuple[int, int, int]]:
+def scan_bit_patterns(
+    bits: Sequence[int], patterns: Sequence[int] = (0xFB, 0xFA, 0xA1, 0xFE)
+) -> List[Tuple[int, int, int]]:
     """
     Scan bitcell stream for byte patterns across all bit shifts.
     Returns list of (shift, byte_offset, value).
@@ -100,7 +105,9 @@ def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
     return half_med, full_med, threshold
 
 
-def find_sync_bytes(bits: Sequence[int], pattern: int = 0xA1, window: int = 32) -> List[int]:
+def find_sync_bytes(
+    bits: Sequence[int], pattern: int = 0xA1, window: int = 32
+) -> List[int]:
     """
     Locate occurrences of a sync/address mark byte (e.g., 0xA1) that may
     include missing clock bits, by matching against bit-pattern windows.
@@ -215,17 +222,55 @@ def bits_to_bytes(bits: Sequence[int]) -> bytes:
     return bytes(out)
 
 
+def _longest_constant_run(values: bytes) -> int:
+    longest = 0
+    current = 0
+    prev: int | None = None
+    for val in values:
+        if val == prev:
+            current += 1
+        else:
+            current = 1
+            prev = val
+        longest = max(longest, current)
+    return longest
+
+
+def _entropy(values: bytes) -> float:
+    if not values:
+        return 0.0
+    freq = [0] * 256
+    for b in values:
+        freq[b] += 1
+    entropy = 0.0
+    for count in freq:
+        if count:
+            p = count / len(values)
+            entropy -= p * math.log2(p)
+    return entropy
+
+
 def best_aligned_bytes(bits: Sequence[int]) -> Tuple[int, bytes]:
     """
-    Try all bit shifts (0-7) and pick the byte stream with the most 0xFF bytes.
-    This favors alignments that capture sync/preamble runs common in FM.
+    Try all bit shifts (0-7) and pick the byte stream with the most stable content.
+
+    Stability is measured by the dominant fill byte (0x00 or 0xFF), the longest
+    constant run, and overall entropy. This avoids bias toward 0xFF-only streams
+    when inverted captures produce long 0x00 runs.
     """
+
+    def score_candidate(candidate: bytes) -> Tuple[int, int, float]:
+        fill_score = max(candidate.count(0x00), candidate.count(0xFF))
+        run_score = _longest_constant_run(candidate)
+        entropy_score = -_entropy(candidate)
+        return fill_score, run_score, entropy_score
+
     best_shift = 0
     best_bytes = b""
-    best_score = -1
+    best_score: Tuple[int, int, float] = (-1, -1, -math.inf)
     for shift in range(8):
         candidate = bits_to_bytes(bits[shift:])
-        score = candidate.count(0xFF)
+        score = score_candidate(candidate)
         if score > best_score:
             best_score = score
             best_shift = shift
@@ -285,7 +330,7 @@ def pll_decode_bits(
             if to_index is not None:
                 to_index -= clock
                 if to_index < 0:
-                    to_index = (index_ticks / sample_freq_hz)
+                    to_index = index_ticks / sample_freq_hz
 
             ticks -= clock
             if ticks >= clock / 2:
@@ -452,9 +497,13 @@ def scan_fm_sectors(
             data_end = data_start + expected_len + 2
             if data_end <= len(byte_stream):
                 data_bytes = byte_stream[data_start : data_end - 2]
-                data_crc_val = int.from_bytes(byte_stream[data_end - 2 : data_end], "big")
+                data_crc_val = int.from_bytes(
+                    byte_stream[data_end - 2 : data_end], "big"
+                )
                 # Data CRC includes DAM byte in FM
-                data_crc_ok = crc16_ibm(byte_stream[dam_pos : data_end - 2]) == data_crc_val
+                data_crc_ok = (
+                    crc16_ibm(byte_stream[dam_pos : data_end - 2]) == data_crc_val
+                )
 
         guesses.append(
             SectorGuess(

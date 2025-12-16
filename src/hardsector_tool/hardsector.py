@@ -3,8 +3,9 @@ Helpers for hard-sectored flux captures (e.g., 32 holes + index).
 
 Greaseweazle's `--hardsector --raw` mode records one revolution per hole
 tick, so an 8" disk with 32 sector holes plus one index hole yields
-33 entries per full rotation. We group those to make per-rotation
-analysis easier.
+33 entries per full rotation. We group those, detect the index split,
+and merge the two shortest adjacent entries to recover 32 uniform
+intervals per rotation.
 """
 
 from __future__ import annotations
@@ -28,9 +29,17 @@ from .scp import RevolutionEntry, SCPImage, TrackData
 @dataclass(frozen=True)
 class HoleCapture:
     hole_index: int
-    revolution_index: int
+    revolution_indices: tuple[int, ...]
     index_ticks: int
     flux_count: int
+
+    @property
+    def revolution_index(self) -> int:
+        """
+        Primary revolution index for compatibility with single-entry callers.
+        """
+
+        return self.revolution_indices[0]
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,64 @@ def _detect_index_hole_offset(
     return max_idx, confidence
 
 
+def _rotate_list(values: Sequence, offset: int) -> list:
+    if not values:
+        return []
+    adj = offset % len(values)
+    return list(values[adj:] + values[:adj])
+
+
+def _merge_index_splits(
+    revs: Sequence[RevolutionEntry], ordered_indices: Sequence[int]
+) -> list[tuple[tuple[int, ...], int, int]]:
+    """
+    Merge the two shortest, adjacent holes (index split) into one interval.
+
+    Returns a list of tuples: (revolution_indices, combined_index_ticks, combined_flux_count).
+    If no adjacent minimum pair is found, the original ordering is preserved.
+    """
+
+    if len(revs) < 3:
+        return [
+            ((ordered_indices[i],), revs[i].index_ticks, revs[i].flux_count)
+            for i in range(len(revs))
+        ]
+
+    shortest = sorted(range(len(revs)), key=lambda i: revs[i].index_ticks)[:2]
+    shortest.sort()
+
+    def adjacent(a: int, b: int) -> bool:
+        return abs(a - b) == 1 or {a, b} == {0, len(revs) - 1}
+
+    merged: list[tuple[tuple[int, ...], int, int]] = []
+    merged_pair = tuple(shortest) if adjacent(shortest[0], shortest[1]) else None
+    merged_set = set(merged_pair) if merged_pair else set()
+    visited: set[int] = set()
+    for idx in range(len(revs)):
+        if idx in visited:
+            continue
+        partner: int | None = None
+        if merged_pair and idx in merged_set:
+            forward = (idx + 1) % len(revs)
+            backward = (idx - 1) % len(revs)
+            if forward in merged_set and forward not in visited:
+                partner = forward
+            elif backward in merged_set and backward not in visited:
+                partner = backward
+        if partner is not None:
+            indices = (ordered_indices[idx], ordered_indices[partner])
+            merged_ticks = revs[idx].index_ticks + revs[partner].index_ticks
+            merged_flux = revs[idx].flux_count + revs[partner].flux_count
+            merged.append((indices, merged_ticks, merged_flux))
+            visited.update({idx, partner})
+            continue
+        merged.append(
+            ((ordered_indices[idx],), revs[idx].index_ticks, revs[idx].flux_count)
+        )
+        visited.add(idx)
+    return merged
+
+
 def group_hard_sectors(
     track: TrackData,
     sectors_per_rotation: int = 32,
@@ -86,34 +153,37 @@ def group_hard_sectors(
     """
     holes_per_rotation = sectors_per_rotation + 1
     revs = list(track.revolutions)
+    ordered_indices = list(range(len(track.revolutions)))
     rotated_by = 0
     confidence = 0.0
 
-    offset, confidence = _detect_index_hole_offset(revs, holes_per_rotation)
-    should_rotate = (not index_aligned and offset != 0) or (
-        offset != 0 and confidence > 1.2 and not require_strong_index
-    )
-    if should_rotate:
-        rotated_by = offset
-        revs = revs[offset:] + revs[:offset]
-    ordered_indices = list(range(len(track.revolutions)))
-    if should_rotate:
-        ordered_indices = ordered_indices[offset:] + ordered_indices[:offset]
-
     groups: List[List[HoleCapture]] = []
-    for base in range(0, len(revs), holes_per_rotation):
+    for rot_idx, base in enumerate(range(0, len(revs), holes_per_rotation)):
         chunk = revs[base : base + holes_per_rotation]
         if len(chunk) < holes_per_rotation:
             break
+        chunk_indices = ordered_indices[base : base + holes_per_rotation]
+
+        offset, chunk_conf = _detect_index_hole_offset(chunk, holes_per_rotation)
+        if rot_idx == 0:
+            confidence = chunk_conf
+            rotated_by = offset if offset else 0
+        should_rotate = (not index_aligned and offset != 0) or (
+            offset != 0 and chunk_conf > 1.1 and not require_strong_index
+        )
+        if should_rotate:
+            chunk = _rotate_list(chunk, offset)
+            chunk_indices = _rotate_list(chunk_indices, offset)
+
+        merged = _merge_index_splits(chunk, chunk_indices)
         captures: List[HoleCapture] = []
-        for i, rev in enumerate(chunk):
-            orig_idx = ordered_indices[base + i]
+        for idx, (rev_indices, ticks, flux_count) in enumerate(merged):
             captures.append(
                 HoleCapture(
-                    hole_index=i,
-                    revolution_index=orig_idx,
-                    index_ticks=rev.index_ticks,
-                    flux_count=rev.flux_count,
+                    hole_index=idx,
+                    revolution_indices=tuple(rev_indices),
+                    index_ticks=ticks,
+                    flux_count=flux_count,
                 )
             )
         groups.append(captures)
@@ -139,7 +209,10 @@ def decode_hole(
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
     """
-    flux = track.decode_flux(hole_capture.revolution_index)
+    flux_parts = [track.decode_flux(idx) for idx in hole_capture.revolution_indices]
+    flux: list[int] = []
+    for part in flux_parts:
+        flux.extend(part)
     if encoding.lower() == "mfm":
         decoded = decode_mfm_bytes(
             flux,
@@ -166,7 +239,9 @@ def decode_hole(
     return sectors[0] if sectors else None
 
 
-def compute_flux_index_deltas(track: TrackData, max_entries: Optional[int] = None) -> List[int]:
+def compute_flux_index_deltas(
+    track: TrackData, max_entries: Optional[int] = None
+) -> List[int]:
     """
     Compare recorded index_ticks to the sum of flux intervals for each entry.
 
@@ -174,12 +249,49 @@ def compute_flux_index_deltas(track: TrackData, max_entries: Optional[int] = Non
     mis-parsed offsets.
     """
     deltas: List[int] = []
-    limit = track.revolution_count if max_entries is None else min(max_entries, track.revolution_count)
+    limit = (
+        track.revolution_count
+        if max_entries is None
+        else min(max_entries, track.revolution_count)
+    )
     for idx in range(limit):
         flux = track.decode_flux(idx)
         delta = track.revolutions[idx].index_ticks - sum(flux)
         deltas.append(delta)
     return deltas
+
+
+def compute_flux_index_diagnostics(
+    track: TrackData, grouping: HardSectorGrouping, rotation_index: int = 0
+) -> List[dict]:
+    """
+    Return per-hole diagnostics comparing index_ticks to summed flux intervals.
+
+    Each entry includes the revolution indices used, summed flux, raw delta,
+    and ratio (flux/index).
+    """
+
+    if rotation_index >= grouping.rotations:
+        return []
+
+    diagnostics: List[dict] = []
+    for hole in grouping.groups[rotation_index]:
+        flux_total = 0
+        for idx in hole.revolution_indices:
+            flux_total += sum(track.decode_flux(idx))
+        delta = hole.index_ticks - flux_total
+        ratio = (flux_total / hole.index_ticks) if hole.index_ticks else 0.0
+        diagnostics.append(
+            {
+                "hole_index": hole.hole_index,
+                "revolution_indices": hole.revolution_indices,
+                "index_ticks": hole.index_ticks,
+                "flux_total": flux_total,
+                "delta": delta,
+                "ratio": ratio,
+            }
+        )
+    return diagnostics
 
 
 def stitch_rotation_flux(
@@ -201,10 +313,13 @@ def stitch_rotation_flux(
     holes = grouping.groups[rotation_index]
     total_index_ticks = sum(h.index_ticks for h in holes)
     for hole in holes:
-        flux = track.decode_flux(hole.revolution_index)
-        stitched.extend(flux)
+        hole_flux_total = 0
+        for idx in hole.revolution_indices:
+            flux = track.decode_flux(idx)
+            hole_flux_total += sum(flux)
+            stitched.extend(flux)
         if compensate_gaps:
-            delta = hole.index_ticks - sum(flux)
+            delta = hole.index_ticks - hole_flux_total
             if delta > 0:
                 stitched.append(delta)
     return stitched, total_index_ticks
@@ -222,7 +337,9 @@ def decode_hole_bytes(
     """
     Decode one hole's flux and return raw decoded bytes without sector framing.
     """
-    flux = track.decode_flux(hole_capture.revolution_index)
+    flux: list[int] = []
+    for idx in hole_capture.revolution_indices:
+        flux.extend(track.decode_flux(idx))
     if encoding.lower() == "mfm":
         decoded = decode_mfm_bytes(
             flux,
@@ -266,7 +383,9 @@ def assemble_rotation(
     guesses: List[SectorGuess] = []
     initial_clock = None
     if calibrate_rotation and grouping.groups[rotation_index]:
-        first_flux = track.decode_flux(grouping.groups[rotation_index][0].revolution_index)
+        first_flux = track.decode_flux(
+            grouping.groups[rotation_index][0].revolution_index
+        )
         half, _, _ = estimate_cell_ticks(first_flux)
         initial_clock = half * 2
 
