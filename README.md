@@ -32,9 +32,9 @@ Key options:
 - `--use-pll`, `--calibrate-rotation`, `--require-sync`: adjust decoding strictness.
 
 ## Current Wang OIS sample status
-- SCP header shows 198 revolutions per track; 77 even-numbered tracks populated.
-- Flux decode and hard-sector grouping work, but no valid FM IDAMs/CRCs are detected yet under FM/MFM heuristics; assembled images are all fill bytes. Further format-specific decoding is needed for Wang OIS.
-- Next steps: refine sync/address-mark detection (missing-clock patterns), tune PLL per rotation, and add a Wang directory/sector parser once sectors are recovered.
+- SCP header: 198 revolutions per track; 77 even-numbered tracks populated; 32 sector holes + 1 index per rotation.
+- Attempts so far (FM/MFM, strict/loose, synthetic-from-holes, PLL tuning) do not yield valid IDAMs/CRCs; assembled images are all fill bytes. Hole-level decodes mostly read as 0xFF bursts with short payloads.
+- Investigation continues: next probes will sweep multiple tracks, adjust sync/mark heuristics, and extract raw hole payload dumps for manual analysis. A Wang-specific directory/sector parser will follow once sectors are recovered.
 
 ## Notes for other formats
 - CP/M presets are available (`--preset cpm-16x256` or `--preset cpm-26x128`), but sample media for validation is still needed.

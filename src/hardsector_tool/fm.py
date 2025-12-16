@@ -59,6 +59,18 @@ class SectorGuess:
     data: Optional[bytes] = None
 
 
+def scan_data_marks(byte_stream: bytes, marks: Sequence[int] = (0xFB, 0xFA)) -> List[Tuple[int, int]]:
+    """
+    Scan for data mark bytes (e.g., 0xFB/0xFA) without CRC validation.
+    Returns list of (offset, mark) pairs.
+    """
+    hits: List[Tuple[int, int]] = []
+    for i, b in enumerate(byte_stream):
+        if b in marks:
+            hits.append((i, b))
+    return hits
+
+
 def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
     """
     Estimate half and full cell durations from a flux interval distribution.

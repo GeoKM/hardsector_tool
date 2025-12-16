@@ -19,6 +19,7 @@ from .fm import (
     estimate_cell_ticks,
     pll_decode_bits,
     pll_decode_fm_bytes,
+    scan_data_marks,
     mfm_bytes_from_bitcells,
     scan_fm_sectors,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "MFMDecodeResult",
     "decode_mfm_bytes",
     "mfm_bytes_from_bitcells",
+    "scan_data_marks",
     "SectorGuess",
     "HardSectorGrouping",
     "HoleCapture",

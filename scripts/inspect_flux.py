@@ -17,6 +17,8 @@ from hardsector_tool.fm import (
     decode_fm_bytes,
     decode_mfm_bytes,
     pll_decode_fm_bytes,
+    pll_decode_bits,
+    scan_data_marks,
     scan_fm_sectors,
 )
 from hardsector_tool.hardsector import (
@@ -24,6 +26,7 @@ from hardsector_tool.hardsector import (
     assemble_rotation,
     best_sector_map,
     decode_hole,
+    decode_hole_bytes,
     group_hard_sectors,
     decode_track_best_map,
     build_raw_image,
@@ -167,6 +170,23 @@ def main() -> None:
         help="If no IDAMs are found, synthesize sectors from hole payloads (mod expected sector count).",
     )
     parser.add_argument(
+        "--dump-holes",
+        type=Path,
+        default=None,
+        help="Directory to dump raw decoded bytes per hole (first rotation of each track in image-out range).",
+    )
+    parser.add_argument(
+        "--dump-bitcells",
+        type=Path,
+        default=None,
+        help="Directory to dump PLL bitcells per hole (first rotation of each track in image-out range).",
+    )
+    parser.add_argument(
+        "--scan-marks",
+        action="store_true",
+        help="Scan decoded bytes for data marks (0xFB/0xFA) without CRC.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -177,6 +197,12 @@ def main() -> None:
         type=Path,
         default=None,
         help="Write a flat image assembled from best sector maps across tracks.",
+    )
+    parser.add_argument(
+        "--track-range",
+        type=str,
+        default=None,
+        help="Track range to process for image-out (e.g., 0-20,40,42). Defaults to all present tracks.",
     )
     parser.add_argument(
         "--require-sync",
@@ -288,6 +314,10 @@ def main() -> None:
                         f"  off {g.offset:06d}: C/H/S={g.track}/{g.head}/{g.sector_id} "
                         f"size={g.length} crc_ok={g.crc_ok} id_crc={g.id_crc_ok} data_crc={g.data_crc_ok}"
                     )
+        if args.scan_marks:
+            marks = scan_data_marks(result.bytes_out)
+            if marks:
+                print(f" Data marks found at offsets: {', '.join(str(m[0]) for m in marks[:20])}")
 
     if args.hard_sector_summary and args.scan_sectors and tracks:
         track = image.read_track(tracks[0])
@@ -361,8 +391,19 @@ def main() -> None:
 
     # Whole-disk pass: assemble best sector maps across all present tracks.
     if args.image_out:
+        if args.track_range:
+            selected = []
+            for part in args.track_range.split(","):
+                if "-" in part:
+                    start, end = part.split("-", 1)
+                    selected.extend(range(int(start), int(end) + 1))
+                else:
+                    selected.append(int(part))
+            track_list = [t for t in selected if t in present_tracks]
+        else:
+            track_list = list(present_tracks)
         track_maps = {}
-        for t in present_tracks:
+        for t in track_list:
             best_map = decode_track_best_map(
                 image,
                 t,
@@ -379,7 +420,7 @@ def main() -> None:
             track_maps[t] = best_map
         raw = build_raw_image(
             track_maps,
-            track_order=list(present_tracks),
+            track_order=track_list,
             expected_sectors=args.expected_sectors,
             expected_size=args.sector_size,
             fill_byte=0x00,
@@ -387,6 +428,54 @@ def main() -> None:
         args.image_out.parent.mkdir(parents=True, exist_ok=True)
         args.image_out.write_bytes(raw)
         print(f"\nWrote assembled image to {args.image_out} ({len(raw)} bytes)")
+
+        if args.dump_holes:
+            outdir = args.dump_holes
+            outdir.mkdir(parents=True, exist_ok=True)
+            for t in track_list:
+                track = image.read_track(t)
+                if not track:
+                    continue
+                grouping = group_hard_sectors(track, sectors_per_rotation=32)
+                if not grouping.groups:
+                    continue
+                first_rot = grouping.groups[0]
+                for hole in first_rot:
+                    data = decode_hole_bytes(
+                        image,
+                        track,
+                        hole,
+                        use_pll=args.use_pll,
+                        encoding=args.encoding,
+                        initial_clock_ticks=None,
+                        clock_adjust=args.clock_adjust,
+                    )
+                    fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bin"
+                    fname.write_bytes(data)
+            print(f"Wrote hole dumps to {outdir}")
+
+        if args.dump_bitcells:
+            outdir = args.dump_bitcells
+            outdir.mkdir(parents=True, exist_ok=True)
+            for t in track_list:
+                track = image.read_track(t)
+                if not track:
+                    continue
+                grouping = group_hard_sectors(track, sectors_per_rotation=32)
+                if not grouping.groups:
+                    continue
+                first_rot = grouping.groups[0]
+                for hole in first_rot:
+                    flux = track.decode_flux(hole.revolution_index)
+                    bits = pll_decode_bits(
+                        flux,
+                        sample_freq_hz=image.sample_freq_hz,
+                        index_ticks=hole.index_ticks,
+                        clock_adjust=args.clock_adjust,
+                    )
+                    fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bits"
+                    fname.write_bytes(bytes(bits))
+            print(f"Wrote bitcell dumps to {outdir}")
 
 
 if __name__ == "__main__":
