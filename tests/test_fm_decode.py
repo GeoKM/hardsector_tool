@@ -41,3 +41,15 @@ def test_pll_decode_and_sector_scan() -> None:
     guesses = scan_fm_sectors(pll_result.bytes_out)
     # Sector guesses may be zero on noisy data but should not raise.
     assert isinstance(guesses, list)
+
+
+def test_scan_require_sync_filters_results() -> None:
+    # Create a minimal stream with FE but no sync, then with sync.
+    stream_no_sync = bytes([0x00, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00])
+    assert scan_fm_sectors(stream_no_sync, require_sync=False) == []
+    assert scan_fm_sectors(stream_no_sync, require_sync=True) == []
+
+    stream_with_sync = bytes([0xA1, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00])
+    assert scan_fm_sectors(stream_with_sync, require_sync=False) == []
+    # With sync required, it still has too few bytes to form a sector, but call should work.
+    assert scan_fm_sectors(stream_with_sync, require_sync=True) == []

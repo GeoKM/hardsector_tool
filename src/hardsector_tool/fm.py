@@ -259,17 +259,21 @@ def crc16_ibm(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def scan_fm_sectors(byte_stream: bytes) -> List[SectorGuess]:
+def scan_fm_sectors(byte_stream: bytes, require_sync: bool = False) -> List[SectorGuess]:
     """
     Heuristically scan for FM address marks (0xFE) and data fields.
 
     Assumes standard IBM FM layout with 0xFE IDAM and size codes that map
-    to lengths of 128 << size_code.
+    to lengths of 128 << size_code. If require_sync is True, only accept
+    IDAMs preceded by an 0xA1 sync byte within the previous three bytes.
     """
     guesses: List[SectorGuess] = []
     i = 0
     while i < len(byte_stream) - 8:
         if byte_stream[i] != 0xFE:
+            i += 1
+            continue
+        if require_sync and 0xA1 not in byte_stream[max(0, i - 3) : i]:
             i += 1
             continue
         if i + 6 >= len(byte_stream):

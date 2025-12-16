@@ -118,6 +118,17 @@ def main() -> None:
         action="store_true",
         help="Assemble a best-effort sector map across all rotations (assumes 16x256).",
     )
+    parser.add_argument(
+        "--write-sectors",
+        type=Path,
+        default=None,
+        help="Directory to write decoded sectors from the best map (implies --sector-map).",
+    )
+    parser.add_argument(
+        "--require-sync",
+        action="store_true",
+        help="Require an 0xA1 sync byte before IDAM when scanning sectors.",
+    )
     args = parser.parse_args()
 
     image = SCPImage.from_file(args.scp_path)
@@ -202,7 +213,7 @@ def main() -> None:
             )
         )
         if args.scan_sectors:
-            guesses = scan_fm_sectors(result.bytes_out)
+            guesses = scan_fm_sectors(result.bytes_out, require_sync=args.require_sync)
             if not guesses:
                 print(" No FM sectors detected")
             else:
@@ -219,7 +230,12 @@ def main() -> None:
             grouping = group_hard_sectors(track, sectors_per_rotation=32)
             rotation = min(args.rotation, grouping.rotations - 1)
             guesses = assemble_rotation(
-                image, track, grouping, rotation_index=rotation, use_pll=args.use_pll
+                image,
+                track,
+                grouping,
+                rotation_index=rotation,
+                use_pll=args.use_pll,
+                require_sync=args.require_sync,
             )
             if guesses:
                 print(f"\nRotation {rotation} sector guesses (first 16):")
@@ -228,9 +244,16 @@ def main() -> None:
                         f"  hole? off={g.offset:06d} C/H/S={g.track}/{g.head}/{g.sector_id} "
                         f"size={g.length} crc_ok={g.crc_ok}"
                     )
-            if args.sector_map:
+            if args.sector_map or args.write_sectors:
                 all_rotations = [
-                    assemble_rotation(image, track, grouping, r, use_pll=args.use_pll)
+                    assemble_rotation(
+                        image,
+                        track,
+                        grouping,
+                        r,
+                        use_pll=args.use_pll,
+                        require_sync=args.require_sync,
+                    )
                     for r in range(grouping.rotations)
                 ]
                 best = best_sector_map(
@@ -248,6 +271,16 @@ def main() -> None:
                         f"  sector {sid:02d}: C/H/S={g.track}/{g.head}/{g.sector_id} "
                         f"len={g.length} status={status}"
                     )
+                if args.write_sectors:
+                    outdir = args.write_sectors
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    print(f"\nWriting sectors to {outdir}")
+                    for sid, g in best.items():
+                        if g.data is None:
+                            continue
+                        fname = outdir / f"track{tracks[0]:02d}_head0_sector{sid:02d}.bin"
+                        fname.write_bytes(g.data)
+                        print(f"  wrote {fname} ({len(g.data)} bytes)")
 
 
 if __name__ == "__main__":
