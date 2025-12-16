@@ -260,7 +260,7 @@ def main() -> None:
             " {meta}, bit shift {shift}\n"
             " first 64 bytes: {preview}".format(
                 t=target_track,
-                method=getattr(result, \"method\", \"\"),  # type: ignore[arg-type]
+                method=getattr(result, "method", ""),  # type: ignore[arg-type]
                 meta=meta,
                 shift=result.bit_shift,
                 preview=hex_preview,
