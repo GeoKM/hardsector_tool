@@ -13,6 +13,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
+from hardsector_tool.fm import decode_fm_bytes
 from hardsector_tool.scp import SCPImage
 
 
@@ -74,6 +75,11 @@ def main() -> None:
         default=1,
         help="Revolutions per track to decode (0 = all, default 1)",
     )
+    parser.add_argument(
+        "--decode-fm",
+        action="store_true",
+        help="Attempt FM byte decode for the first selected track/rev",
+    )
     args = parser.parse_args()
 
     image = SCPImage.from_file(args.scp_path)
@@ -99,6 +105,29 @@ def main() -> None:
 
     print("\nTrack details:")
     summarize_tracks(image, tracks, args.revs)
+
+    if args.decode_fm and tracks:
+        track = image.read_track(tracks[0])
+        if track is None:
+            print("\nFM decode skipped: no data on track")
+            return
+        flux = track.decode_flux(0)
+        result = decode_fm_bytes(flux)
+        preview = result.bytes_out[:64]
+        hex_preview = " ".join(f"{b:02x}" for b in preview)
+        print(
+            "\nFM decode (track {t}, rev 0):\n"
+            " half-cell ~{hc:.1f} ticks, full-cell ~{fc:.1f} ticks, "
+            "threshold {thr:.1f}, bit shift {shift}\n"
+            " first 64 bytes: {preview}".format(
+                t=tracks[0],
+                hc=result.half_cell_ticks,
+                fc=result.full_cell_ticks,
+                thr=result.threshold_ticks,
+                shift=result.bit_shift,
+                preview=hex_preview,
+            )
+        )
 
 
 if __name__ == "__main__":
