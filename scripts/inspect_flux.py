@@ -41,7 +41,11 @@ from hardsector_tool.hardsector import (
     stitch_rotation_flux,
 )
 from hardsector_tool.scp import SCPImage
-from hardsector_tool.wang import reconstruct_track, summarize_wang_map
+from hardsector_tool.wang import (
+    detect_header_candidates,
+    reconstruct_track,
+    summarize_wang_map,
+)
 
 
 def ticks_to_us(ticks: int, sample_freq_hz: int) -> float:
@@ -355,6 +359,12 @@ def main() -> None:
         "--wang-decode",
         action="store_true",
         help="Run Wang/OIS HS32 pairing, voting, and checksum sweep.",
+    )
+    parser.add_argument(
+        "--dump-wang-raw",
+        type=Path,
+        default=None,
+        help="Directory to dump Wang consensus/payload/confidence artifacts.",
     )
     parser.add_argument(
         "--show-hole-timing",
@@ -1158,21 +1168,71 @@ def main() -> None:
             print("\nWang/OIS HS32 reconstruction:")
             for t in candidates:
                 best_map: dict[int, object] | None = None
+                best_recon: dict[int, object] | None = None
                 best_len = -1
+                best_score = -1.0
+                best_phase = 0
                 for phase in (0, 1):
-                    wang_map = reconstruct_track(
+                    print(f"\n Track {t} pairing phase {phase}:")
+                    wang_map, recon, score = reconstruct_track(
                         image,
                         t,
                         sector_size=args.sector_size,
                         logical_sectors=args.logical_sectors,
                         pair_phase=phase,
                         clock_adjust=args.clock_adjust,
+                        dump_raw=args.dump_wang_raw,
                     )
-                    if len(wang_map) > best_len:
+                    if score > best_score or (
+                        score == best_score and len(wang_map) > best_len
+                    ):
                         best_len = len(wang_map)
                         best_map = wang_map
+                        best_recon = recon
+                        best_score = score
+                        best_phase = phase
                 summary = summarize_wang_map(best_map or {})
-                print(f" Track {t}: {summary}")
+                print(f"\n Track {t} (phase {best_phase}): {summary}")
+                if best_recon:
+                    for sid in sorted(best_recon):
+                        rec = best_recon[sid]
+                        dropped = ",".join(str(i) for i in rec.dropped_rotations)
+                        dropped = dropped or "-"
+                        kept = ",".join(str(i) for i in rec.kept_rotations)
+                        print(
+                            "  "
+                            f"sector {sid:02d}: mean_sim={rec.mean_similarity_kept:.2f} "
+                            f"kept=[{kept}] dropped=[{dropped}] "
+                            f"offset={rec.payload_offset} window_score={rec.window_score:.2f}"
+                        )
+                        rot_stats = "; ".join(
+                            (
+                                f"r{stat.rotation_index}:mean={stat.mean:.2f} "
+                                f"min={stat.minimum:.2f} max={stat.maximum:.2f} "
+                                f"shift={(stat.shift or 0):+d} "
+                                f"sim_ref={(stat.similarity_to_reference or 0.0):.2f}"
+                            )
+                            for stat in rec.rotation_similarity
+                        )
+                        if rot_stats:
+                            print(f"    rotation similarity: {rot_stats}")
+                    header_hits = detect_header_candidates(
+                        best_recon, args.logical_sectors, t
+                    )
+                    if header_hits.get("track") or header_hits.get("sector"):
+                        track_part = (
+                            " track@" + ",".join(str(o) for o in header_hits.get("track", []))
+                            if header_hits.get("track")
+                            else ""
+                        )
+                        sector_part = (
+                            (" and " if track_part else "  ")
+                            + "sector@"
+                            + ",".join(str(o) for o in header_hits.get("sector", []))
+                            if header_hits.get("sector")
+                            else ""
+                        )
+                        print(f"  Header field candidates:{track_part}{sector_part}")
 
 
 if __name__ == "__main__":
