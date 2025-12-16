@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import median
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_CLOCK_ADJ = 0.10
 PLL_PERIOD_ADJ = 0.05
@@ -47,6 +47,9 @@ class SectorGuess:
     size_code: int
     length: int
     crc_ok: bool
+    id_crc_ok: bool
+    data_crc_ok: bool
+    data: Optional[bytes] = None
 
 
 def estimate_cell_ticks(flux: Sequence[int]) -> Tuple[float, float, float]:
@@ -245,17 +248,17 @@ def scan_fm_sectors(byte_stream: bytes) -> List[SectorGuess]:
             byte_stream[i + 4],
         )
         expected_len = 128 << size_code if size_code < 7 else 0
-        id_crc_ok = crc16_ibm(byte_stream[i : i + 5]) == int.from_bytes(
-            byte_stream[i + 5 : i + 7], "big"
-        )
+        id_crc_val = int.from_bytes(byte_stream[i + 5 : i + 7], "big")
+        id_crc_ok = crc16_ibm(byte_stream[i : i + 5]) == id_crc_val
 
         data_start = i + 7
         data_end = data_start + expected_len + 2
-        crc_ok = False
+        data_crc_ok = False
+        data_bytes: Optional[bytes] = None
         if expected_len and data_end <= len(byte_stream):
-            crc_ok = crc16_ibm(byte_stream[data_start:data_end - 2]) == int.from_bytes(
-                byte_stream[data_end - 2 : data_end], "big"
-            )
+            data_bytes = byte_stream[data_start : data_end - 2]
+            data_crc_val = int.from_bytes(byte_stream[data_end - 2 : data_end], "big")
+            data_crc_ok = crc16_ibm(data_bytes) == data_crc_val
 
         guesses.append(
             SectorGuess(
@@ -265,7 +268,10 @@ def scan_fm_sectors(byte_stream: bytes) -> List[SectorGuess]:
                 sector_id=sector_id,
                 size_code=size_code,
                 length=expected_len,
-                crc_ok=id_crc_ok and crc_ok,
+                crc_ok=id_crc_ok and data_crc_ok,
+                id_crc_ok=id_crc_ok,
+                data_crc_ok=data_crc_ok,
+                data=data_bytes,
             )
         )
         i += 1

@@ -10,9 +10,14 @@ analysis easier.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
-from .fm import decode_fm_bytes, pll_decode_fm_bytes
+from .fm import (
+    SectorGuess,
+    decode_fm_bytes,
+    pll_decode_fm_bytes,
+    scan_fm_sectors,
+)
 from .scp import SCPImage, TrackData
 
 
@@ -64,15 +69,39 @@ def decode_hole(
     track: TrackData,
     hole_capture: HoleCapture,
     use_pll: bool = False,
-):
+) -> Optional[SectorGuess]:
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
     """
     flux = track.decode_flux(hole_capture.revolution_index)
     if use_pll:
-        return pll_decode_fm_bytes(
+        decoded = pll_decode_fm_bytes(
             flux,
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
         )
-    return decode_fm_bytes(flux)
+    else:
+        decoded = decode_fm_bytes(flux)
+
+    sectors = scan_fm_sectors(decoded.bytes_out)
+    return sectors[0] if sectors else None
+
+
+def assemble_rotation(
+    image: SCPImage,
+    track: TrackData,
+    grouping: HardSectorGrouping,
+    rotation_index: int,
+    use_pll: bool = False,
+) -> List[SectorGuess]:
+    """
+    Decode all holes in a given rotation and return any sector guesses found.
+    """
+    if rotation_index >= grouping.rotations:
+        return []
+    guesses: List[SectorGuess] = []
+    for hole in grouping.groups[rotation_index]:
+        guess = decode_hole(image, track, hole, use_pll=use_pll)
+        if guess:
+            guesses.append(guess)
+    return guesses

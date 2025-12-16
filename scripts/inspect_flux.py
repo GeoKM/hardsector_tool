@@ -14,7 +14,7 @@ from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import decode_fm_bytes, pll_decode_fm_bytes, scan_fm_sectors
-from hardsector_tool.hardsector import decode_hole, group_hard_sectors
+from hardsector_tool.hardsector import assemble_rotation, decode_hole, group_hard_sectors
 from hardsector_tool.scp import SCPImage
 
 
@@ -101,6 +101,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Decode a specific hole (revolution index) instead of the first track default.",
+    )
+    parser.add_argument(
+        "--rotation",
+        type=int,
+        default=0,
+        help="Rotation index to decode in hard-sector mode (default 0).",
     )
     args = parser.parse_args()
 
@@ -194,6 +200,22 @@ def main() -> None:
                 for g in guesses[:16]:
                     print(
                         f"  off {g.offset:06d}: C/H/S={g.track}/{g.head}/{g.sector_id} "
+                        f"size={g.length} crc_ok={g.crc_ok} id_crc={g.id_crc_ok} data_crc={g.data_crc_ok}"
+                    )
+
+    if args.hard_sector_summary and args.scan_sectors and tracks:
+        track = image.read_track(tracks[0])
+        if track:
+            grouping = group_hard_sectors(track, sectors_per_rotation=32)
+            rotation = min(args.rotation, grouping.rotations - 1)
+            guesses = assemble_rotation(
+                image, track, grouping, rotation_index=rotation, use_pll=args.use_pll
+            )
+            if guesses:
+                print(f"\nRotation {rotation} sector guesses (first 16):")
+                for g in guesses[:16]:
+                    print(
+                        f"  hole? off={g.offset:06d} C/H/S={g.track}/{g.head}/{g.sector_id} "
                         f"size={g.length} crc_ok={g.crc_ok}"
                     )
 
