@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .fm import (
+    DEFAULT_CLOCK_ADJ,
     SectorGuess,
     decode_fm_bytes,
     decode_mfm_bytes,
@@ -81,6 +82,7 @@ def decode_hole(
     require_sync: bool = False,
     encoding: str = "fm",
     initial_clock_ticks: float | None = None,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> Optional[SectorGuess]:
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
@@ -92,6 +94,7 @@ def decode_hole(
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
             initial_clock_ticks=initial_clock_ticks,
+            clock_adjust=clock_adjust,
         )
     elif use_pll:
         decoded = pll_decode_fm_bytes(
@@ -99,6 +102,7 @@ def decode_hole(
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
             initial_clock_ticks=initial_clock_ticks,
+            clock_adjust=clock_adjust,
         )
     else:
         decoded = decode_fm_bytes(flux)
@@ -117,6 +121,7 @@ def decode_hole_bytes(
     use_pll: bool = False,
     encoding: str = "fm",
     initial_clock_ticks: float | None = None,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> bytes:
     """
     Decode one hole's flux and return raw decoded bytes without sector framing.
@@ -128,6 +133,7 @@ def decode_hole_bytes(
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
             initial_clock_ticks=initial_clock_ticks,
+            clock_adjust=clock_adjust,
         )
         return decoded.bytes_out
     if use_pll:
@@ -136,6 +142,7 @@ def decode_hole_bytes(
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
             initial_clock_ticks=initial_clock_ticks,
+            clock_adjust=clock_adjust,
         )
         return decoded.bytes_out
     return decode_fm_bytes(flux).bytes_out
@@ -153,6 +160,7 @@ def assemble_rotation(
     synthetic_from_hole: bool = False,
     expected_sectors: int = 16,
     expected_size: int = 256,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> List[SectorGuess]:
     """
     Decode all holes in a given rotation and return any sector guesses found.
@@ -175,6 +183,7 @@ def assemble_rotation(
             require_sync=require_sync,
             encoding=encoding,
             initial_clock_ticks=initial_clock,
+            clock_adjust=clock_adjust,
         )
         if guess and guess.length:
             guesses.append(guess)
@@ -187,6 +196,7 @@ def assemble_rotation(
                 use_pll=use_pll,
                 encoding=encoding,
                 initial_clock_ticks=initial_clock,
+                clock_adjust=clock_adjust,
             )
             payload = raw[:expected_size]
             guesses.append(
@@ -217,6 +227,7 @@ def decode_track_best_map(
     require_sync: bool = False,
     calibrate_rotation: bool = False,
     synthetic_from_holes: bool = False,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> Dict[int, SectorGuess]:
     track = image.read_track(track_number)
     if not track:
@@ -235,6 +246,7 @@ def decode_track_best_map(
             synthetic_from_hole=synthetic_from_holes,
             expected_sectors=expected_sectors,
             expected_size=expected_size,
+            clock_adjust=clock_adjust,
         )
         for r in range(grouping.rotations)
     ]

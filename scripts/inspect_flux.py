@@ -156,6 +156,12 @@ def main() -> None:
         help="Calibrate PLL clock from the first hole in each rotation.",
     )
     parser.add_argument(
+        "--clock-adjust",
+        type=float,
+        default=0.10,
+        help="PLL clock adjustment range (fraction, default 0.10).",
+    )
+    parser.add_argument(
         "--synthetic-from-holes",
         action="store_true",
         help="If no IDAMs are found, synthesize sectors from hole payloads (mod expected sector count).",
@@ -300,6 +306,7 @@ def main() -> None:
                 synthetic_from_hole=args.synthetic_from_holes,
                 expected_sectors=args.expected_sectors,
                 expected_size=args.sector_size,
+                clock_adjust=args.clock_adjust,
             )
             if guesses:
                 print(f"\nRotation {rotation} sector guesses (first 16):")
@@ -322,6 +329,7 @@ def main() -> None:
                         synthetic_from_hole=args.synthetic_from_holes,
                         expected_sectors=args.expected_sectors,
                         expected_size=args.sector_size,
+                        clock_adjust=args.clock_adjust,
                     )
                     for r in range(grouping.rotations)
                 ]
@@ -366,6 +374,7 @@ def main() -> None:
                 require_sync=args.require_sync,
                 calibrate_rotation=args.calibrate_rotation,
                 synthetic_from_holes=args.synthetic_from_holes,
+                clock_adjust=args.clock_adjust,
             )
             track_maps[t] = best_map
         raw = build_raw_image(

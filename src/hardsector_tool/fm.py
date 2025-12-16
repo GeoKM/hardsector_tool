@@ -134,6 +134,7 @@ def decode_mfm_bytes(
     sample_freq_hz: float,
     index_ticks: int | None = None,
     initial_clock_ticks: float | None = None,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> MFMDecodeResult:
     """
     Decode MFM data by PLL to bitcells then collapsing alternating clock/data bits.
@@ -143,6 +144,7 @@ def decode_mfm_bytes(
         sample_freq_hz,
         index_ticks=index_ticks,
         initial_clock_ticks=initial_clock_ticks,
+        clock_adjust=clock_adjust,
     )
     shift, decoded = mfm_bytes_from_bitcells(bitcells)
     return MFMDecodeResult(bytes_out=decoded, bit_shift=shift)
@@ -282,12 +284,14 @@ def pll_decode_fm_bytes(
     sample_freq_hz: float,
     index_ticks: int | None = None,
     initial_clock_ticks: float | None = None,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
 ) -> PLLDecodeResult:
     bitcells = pll_decode_bits(
         flux,
         sample_freq_hz,
         index_ticks=index_ticks,
         initial_clock_ticks=initial_clock_ticks,
+        clock_adjust=clock_adjust,
     )
     shift, decoded = best_aligned_bytes(bitcells)
     half_med, _, _ = estimate_cell_ticks(flux)
