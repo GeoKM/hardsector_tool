@@ -31,7 +31,7 @@ from hardsector_tool.hardsector import (
     FORMAT_PRESETS,
     assemble_rotation,
     best_sector_map,
-    compute_flux_index_deltas,
+    compute_flux_index_diagnostics,
     decode_hole,
     decode_hole_bytes,
     group_hard_sectors,
@@ -90,8 +90,10 @@ def summarize_tracks(image: SCPImage, tracks: Iterable[int], rev_limit: int) -> 
             f"- Track {track}: {data.revolution_count} rev entries, "
             f"flux bytes {len(data.flux_data)}"
         )
-        limit = data.revolution_count if rev_limit <= 0 else min(
-            rev_limit, data.revolution_count
+        limit = (
+            data.revolution_count
+            if rev_limit <= 0
+            else min(rev_limit, data.revolution_count)
         )
         for rev_idx in range(limit):
             rev = data.revolutions[rev_idx]
@@ -427,10 +429,12 @@ def main() -> None:
             print(
                 f"\nHard-sector summary (track {tracks[0]}): "
                 f"{grouping.rotations} rotations, "
-                f"{grouping.sectors_per_rotation}+{grouping.index_holes_per_rotation} holes each "
+                f"{len(grouping.groups[0])} merged intervals (raw {grouping.sectors_per_rotation + 1}) "
                 f"(rotated_by={grouping.rotated_by}, index_conf={grouping.index_confidence:.2f})"
             )
-            avg_tick = sum(r.index_ticks for r in track.revolutions) / track.revolution_count
+            avg_tick = (
+                sum(r.index_ticks for r in track.revolutions) / track.revolution_count
+            )
             print(f" Avg index ticks per hole: {avg_tick:.1f}")
             print(" First rotation hole counts:")
             for hole in grouping.groups[0][:5]:
@@ -439,13 +443,26 @@ def main() -> None:
                     f"ticks={hole.index_ticks} flux_count={hole.flux_count}"
                 )
             if args.flux_deltas:
-                deltas = compute_flux_index_deltas(track, max_entries=64)
-                if deltas:
-                    worst = max(deltas, key=abs)
-                    print(
-                        f" Flux-index deltas (index_ticks - sum(flux)) first {len(deltas)}: "
-                        f"min {min(deltas)} max {max(deltas)} worst_abs {worst}"
+                diagnostics = compute_flux_index_diagnostics(track, grouping)
+                if diagnostics:
+                    deltas = [d["delta"] for d in diagnostics]
+                    ratios = [d["ratio"] for d in diagnostics if d["index_ticks"]]
+                    ratio_str = (
+                        f" ratio range {min(ratios):.3f}-{max(ratios):.3f}"
+                        if ratios
+                        else ""
                     )
+                    print(
+                        f" Flux-index deltas (index_ticks - sum(flux)) rotation 0: "
+                        f"min {min(deltas)} max {max(deltas)} worst_abs {max(deltas, key=abs)}{ratio_str}"
+                    )
+                    for diag in diagnostics:
+                        revs = ",".join(str(r) for r in diag["revolution_indices"])
+                        print(
+                            f"  hole {diag['hole_index']:02d} revs=[{revs}] "
+                            f"flux={diag['flux_total']} idx={diag['index_ticks']} "
+                            f"delta={diag['delta']} ratio={diag['ratio']:.3f}"
+                        )
 
     if args.decode_fm and tracks:
         target_track = tracks[0]
@@ -460,12 +477,16 @@ def main() -> None:
         flux = track.decode_flux(rev_index)
         if args.encoding == "mfm":
             result = decode_mfm_bytes(
-                flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
+                flux,
+                sample_freq_hz=image.sample_freq_hz,
+                index_ticks=track.revolutions[0].index_ticks,
             )
             meta = f"MFM via PLL (bit shift {result.bit_shift})"
         elif args.use_pll:
             result = pll_decode_fm_bytes(
-                flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
+                flux,
+                sample_freq_hz=image.sample_freq_hz,
+                index_ticks=track.revolutions[0].index_ticks,
             )
             meta = f"pll clock ~{result.initial_clock_ticks:.1f} ticks"
         else:
@@ -501,10 +522,16 @@ def main() -> None:
                         f"size={g.length} crc_ok={g.crc_ok} id_crc={g.id_crc_ok} data_crc={g.data_crc_ok}"
                     )
         if args.scan_marks:
-            payload = bytes(~b & 0xFF for b in result.bytes_out) if args.invert_bytes else result.bytes_out
+            payload = (
+                bytes(~b & 0xFF for b in result.bytes_out)
+                if args.invert_bytes
+                else result.bytes_out
+            )
             marks = scan_data_marks(payload)
             if marks:
-                print(f" Data marks found at offsets: {', '.join(str(m[0]) for m in marks[:20])}")
+                print(
+                    f" Data marks found at offsets: {', '.join(str(m[0]) for m in marks[:20])}"
+                )
 
     if args.score_grid and tracks:
         track = image.read_track(tracks[0])
@@ -520,7 +547,9 @@ def main() -> None:
                 track, grouping, rotation_index=0, compensate_gaps=args.stitch_gap_comp
             )
             base_flux = stitched_flux if stitched_flux else track.decode_flux(0)
-            base_ticks = stitched_ticks if stitched_ticks else track.revolutions[0].index_ticks
+            base_ticks = (
+                stitched_ticks if stitched_ticks else track.revolutions[0].index_ticks
+            )
             candidates = []
             mark_set = {0xFE, 0xFB, 0xFA, 0xA1}
             for encoding in ("fm", "mfm"):
@@ -548,7 +577,13 @@ def main() -> None:
                         fill_ratio, entropy = payload_metrics(window)
                         crc_hits = 0
                         if encoding == "fm":
-                            crc_hits = sum(1 for g in scan_fm_sectors(candidate_bytes, require_sync=False) if g.crc_ok)
+                            crc_hits = sum(
+                                1
+                                for g in scan_fm_sectors(
+                                    candidate_bytes, require_sync=False
+                                )
+                                if g.crc_ok
+                            )
                         candidates.append(
                             (
                                 -mark_count,
@@ -566,7 +601,18 @@ def main() -> None:
             candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
             print("\nGrid score candidates (top 6):")
             for entry in candidates[:6]:
-                _, fill_ratio, neg_entropy, _, enc, inv_bits, scale, mark_count, entropy, crc_hits = entry
+                (
+                    _,
+                    fill_ratio,
+                    neg_entropy,
+                    _,
+                    enc,
+                    inv_bits,
+                    scale,
+                    mark_count,
+                    entropy,
+                    crc_hits,
+                ) = entry
                 print(
                     f"  {enc} scale={scale} invert_bits={inv_bits}: "
                     f"marks={mark_count} crc_hits={crc_hits} fill={fill_ratio:.3f} entropy={entropy:.2f}"
@@ -642,7 +688,9 @@ def main() -> None:
                     for sid, g in best.items():
                         if g.data is None:
                             continue
-                        fname = outdir / f"track{tracks[0]:02d}_head0_sector{sid:02d}.bin"
+                        fname = (
+                            outdir / f"track{tracks[0]:02d}_head0_sector{sid:02d}.bin"
+                        )
                         fname.write_bytes(g.data)
                         print(f"  wrote {fname} ({len(g.data)} bytes)")
 
@@ -714,7 +762,9 @@ def main() -> None:
                     fname.write_bytes(data)
             print(f"\nWrote hole dumps to {outdir}")
 
-    needs_bitcells = bool(args.dump_bitcells or args.scan_bit_patterns or args.bruteforce_marks)
+    needs_bitcells = bool(
+        args.dump_bitcells or args.scan_bit_patterns or args.bruteforce_marks
+    )
     if args.fixed_spacing_scan:
         needs_bitcells = True
     if needs_bitcells:
@@ -760,7 +810,10 @@ def main() -> None:
                     )
 
                 hole_iterable = (
-                    [(first_rot[i], first_rot[i + 1]) for i in range(0, len(first_rot) - 1, 2)]
+                    [
+                        (first_rot[i], first_rot[i + 1])
+                        for i in range(0, len(first_rot) - 1, 2)
+                    ]
                     if args.merge_hole_pairs
                     else [(h,) for h in first_rot]
                 )
@@ -788,9 +841,15 @@ def main() -> None:
                                 f"(shift,byte,val): {hits[:10]}"
                             )
                     if args.bruteforce_marks:
-                        patterns = (0xFE, 0xFB) if args.strict_marks else (0xFB, 0xFA, 0xA1, 0xFE)
+                        patterns = (
+                            (0xFE, 0xFB)
+                            if args.strict_marks
+                            else (0xFB, 0xFA, 0xA1, 0xFE)
+                        )
                         payloads = brute_force_mark_payloads(
-                            bits, payload_bytes=args.mark_payload_bytes, patterns=patterns
+                            bits,
+                            payload_bytes=args.mark_payload_bytes,
+                            patterns=patterns,
                         )
                         if not payloads and payload_dir and args.bruteforce_step_bits:
                             # Fallback: brute-force fixed windows even without mark hits.
@@ -799,7 +858,9 @@ def main() -> None:
                             bit_offset = 0
                             idx = 0
                             while bit_offset + window_bits <= len(bits):
-                                payload = bits_to_bytes(bits[bit_offset : bit_offset + window_bits])
+                                payload = bits_to_bytes(
+                                    bits[bit_offset : bit_offset + window_bits]
+                                )
                                 payloads.append((0, bit_offset // 8, 0x00, payload))
                                 bit_offset += step_bits
                                 idx += 1
@@ -811,14 +872,17 @@ def main() -> None:
                                 f"first (shift {first[0]}, off {first[1]}, val {first[2]:02x}) {preview}"
                             )
                             if payload_dir:
-                                for idx, (shift, off, val, payload) in enumerate(payloads[:payload_cap]):
+                                for idx, (shift, off, val, payload) in enumerate(
+                                    payloads[:payload_cap]
+                                ):
                                     fname = payload_dir / (
                                         f"track{t:03d}_{label}_"
                                         f"shift{shift}_off{off:05d}_val{val:02x}.bin"
                                     )
                                     fname.write_bytes(payload)
                                     record_payload(
-                                        f"{t}:{label}:mark_shift{shift}_off{off}", payload
+                                        f"{t}:{label}:mark_shift{shift}_off{off}",
+                                        payload,
                                     )
                                 if len(payloads) > payload_cap:
                                     print(
@@ -827,7 +891,8 @@ def main() -> None:
                             else:
                                 for shift, off, val, payload in payloads[:payload_cap]:
                                     record_payload(
-                                        f"{t}:{label}:mark_shift{shift}_off{off}", payload
+                                        f"{t}:{label}:mark_shift{shift}_off{off}",
+                                        payload,
                                     )
                     if args.fixed_spacing_scan and len(entry) == 2 and payload_dir:
                         step_bits = args.fixed_spacing_step
@@ -836,13 +901,17 @@ def main() -> None:
                         bit_offset = 0
                         idx = 0
                         while bit_offset + window_bits <= len(bits):
-                            window = bits_to_bytes(bits[bit_offset : bit_offset + window_bits])
+                            window = bits_to_bytes(
+                                bits[bit_offset : bit_offset + window_bits]
+                            )
                             fname = payload_dir / (
                                 f"track{t:03d}_{label}_fixed{idx:03d}_"
                                 f"off{bit_offset:05d}_len{len(window):03d}.bin"
                             )
                             fname.write_bytes(window)
-                            record_payload(f"{t}:{label}:fixed{idx}_off{bit_offset}", window)
+                            record_payload(
+                                f"{t}:{label}:fixed{idx}_off{bit_offset}", window
+                            )
                             bit_offset += step_bits
                             idx += 1
                 if args.stitch_rotation:
@@ -879,20 +948,34 @@ def main() -> None:
                                     f"Track {t} {label}: bit-pattern hits (shift,byte,val): {hits[:10]}"
                                 )
                         if args.bruteforce_marks:
-                            patterns = (0xFE, 0xFB) if args.strict_marks else (0xFB, 0xFA, 0xA1, 0xFE)
+                            patterns = (
+                                (0xFE, 0xFB)
+                                if args.strict_marks
+                                else (0xFB, 0xFA, 0xA1, 0xFE)
+                            )
                             payloads = brute_force_mark_payloads(
-                                stitched_bits, payload_bytes=args.mark_payload_bytes, patterns=patterns
+                                stitched_bits,
+                                payload_bytes=args.mark_payload_bytes,
+                                patterns=patterns,
                             )
                             if payloads and payload_dir:
-                                for idx, (shift, off, val, payload) in enumerate(payloads[:payload_cap]):
+                                for idx, (shift, off, val, payload) in enumerate(
+                                    payloads[:payload_cap]
+                                ):
                                     fname = payload_dir / (
                                         f"track{t:03d}_{label}_shift{shift}_off{off:05d}_val{val:02x}.bin"
                                     )
                                     fname.write_bytes(payload)
-                                    record_payload(f"{t}:{label}:mark_shift{shift}_off{off}", payload)
+                                    record_payload(
+                                        f"{t}:{label}:mark_shift{shift}_off{off}",
+                                        payload,
+                                    )
                             elif payloads:
                                 for shift, off, val, payload in payloads[:payload_cap]:
-                                    record_payload(f"{t}:{label}:mark_shift{shift}_off{off}", payload)
+                                    record_payload(
+                                        f"{t}:{label}:mark_shift{shift}_off{off}",
+                                        payload,
+                                    )
             if outdir:
                 print(f"\nWrote bitcell dumps to {outdir}")
             if payload_dir:
