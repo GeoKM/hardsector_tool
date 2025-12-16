@@ -9,34 +9,35 @@ Example:
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
 from hardsector_tool.fm import (
-    brute_force_mark_payloads,
     bits_to_bytes,
+    brute_force_mark_payloads,
     decode_fm_bytes,
     decode_mfm_bytes,
     fm_bytes_from_bitcells,
     mfm_bytes_from_bitcells,
-    pll_decode_fm_bytes,
     pll_decode_bits,
-    scan_data_marks,
+    pll_decode_fm_bytes,
     scan_bit_patterns,
+    scan_data_marks,
     scan_fm_sectors,
 )
 from hardsector_tool.hardsector import (
     FORMAT_PRESETS,
+    HoleCapture,
     assemble_rotation,
+    best_payload_windows,
     best_sector_map,
-    compute_flux_index_diagnostics,
-    decode_hole,
-    decode_hole_bytes,
-    group_hard_sectors,
-    decode_track_best_map,
     build_raw_image,
+    compute_flux_index_diagnostics,
+    decode_hole_bytes,
+    decode_track_best_map,
+    group_hard_sectors,
+    payload_metrics,
     stitch_rotation_flux,
 )
 from hardsector_tool.scp import SCPImage
@@ -48,24 +49,6 @@ def ticks_to_us(ticks: int, sample_freq_hz: int) -> float:
 
 def fmt_tick_span(ticks: int, sample_freq_hz: int) -> str:
     return f"{ticks_to_us(ticks, sample_freq_hz):.2f} us"
-
-
-FILL_BYTES = {0xFF, 0xFE, 0xFB, 0xF7, 0xEF, 0xDF, 0xFD, 0xBF, 0x7F}
-
-
-def payload_metrics(data: bytes) -> tuple[float, float]:
-    if not data:
-        return 1.0, 0.0
-    fill_ratio = sum(1 for b in data if b in FILL_BYTES) / len(data)
-    freq = [0] * 256
-    for b in data:
-        freq[b] += 1
-    entropy = 0.0
-    for count in freq:
-        if count:
-            p = count / len(data)
-            entropy -= p * math.log2(p)
-    return fill_ratio, entropy
 
 
 def describe_flux(flux: list[int], sample_freq_hz: int) -> str:
@@ -175,6 +158,18 @@ def main() -> None:
         help="Expected sectors per track when building sector map.",
     )
     parser.add_argument(
+        "--physical-sectors",
+        type=int,
+        default=32,
+        help="Physical hard-sector holes per rotation (post index-merge).",
+    )
+    parser.add_argument(
+        "--logical-sectors",
+        type=int,
+        default=16,
+        help="Logical sectors when pairing holes (e.g., 16 for 256-byte logical on HS32).",
+    )
+    parser.add_argument(
         "--sector-size",
         type=int,
         default=256,
@@ -268,6 +263,11 @@ def main() -> None:
         help="Concatenate consecutive hole bitstreams (0+1, 2+3, ...) before scanning/dumping.",
     )
     parser.add_argument(
+        "--pair-holes",
+        action="store_true",
+        help="Alias for --merge-hole-pairs (pairs holes after index-split merge).",
+    )
+    parser.add_argument(
         "--fixed-spacing-scan",
         action="store_true",
         help="When merging hole pairs, also slice fixed-size windows (mark-free) for inspection.",
@@ -288,6 +288,12 @@ def main() -> None:
         "--report-entropy",
         action="store_true",
         help="Report top payload windows by lowest fill-ratio/highest entropy (mark and fixed-spacing payloads).",
+    )
+    parser.add_argument(
+        "--payload-windows",
+        type=int,
+        default=1,
+        help="Top-N payload windows to keep per hole when extracting raw payloads (default 1).",
     )
     parser.add_argument(
         "--strict-marks",
@@ -353,6 +359,10 @@ def main() -> None:
         args.expected_sectors = preset["expected_sectors"]
         args.sector_size = preset["sector_size"]
         args.encoding = preset["encoding"]
+
+    args.pair_holes = args.pair_holes or args.merge_hole_pairs
+    if args.pair_holes:
+        args.expected_sectors = args.logical_sectors
 
     image = SCPImage.from_file(args.scp_path)
     hdr = image.header
@@ -423,7 +433,7 @@ def main() -> None:
         else:
             grouping = group_hard_sectors(
                 track,
-                sectors_per_rotation=32,
+                sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
             )
             print(
@@ -432,6 +442,13 @@ def main() -> None:
                 f"{len(grouping.groups[0])} merged intervals (raw {grouping.sectors_per_rotation + 1}) "
                 f"(rotated_by={grouping.rotated_by}, index_conf={grouping.index_confidence:.2f})"
             )
+            if grouping.short_pair_positions:
+                short = grouping.short_pair_positions[0]
+                if short is not None:
+                    print(
+                        f" Index-split short pair starts at capture {short} "
+                        f"(holes {short} & {(short + 1) % (args.physical_sectors + 1)})"
+                    )
             avg_tick = (
                 sum(r.index_ticks for r in track.revolutions) / track.revolution_count
             )
@@ -540,7 +557,7 @@ def main() -> None:
         else:
             grouping = group_hard_sectors(
                 track,
-                sectors_per_rotation=32,
+                sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
             )
             stitched_flux, stitched_ticks = stitch_rotation_flux(
@@ -623,7 +640,7 @@ def main() -> None:
         if track:
             grouping = group_hard_sectors(
                 track,
-                sectors_per_rotation=32,
+                sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
             )
             rotation = min(args.rotation, grouping.rotations - 1)
@@ -706,7 +723,7 @@ def main() -> None:
                 best_map = decode_track_best_map(
                     image,
                     t,
-                    sectors_per_rotation=32,
+                    sectors_per_rotation=args.physical_sectors,
                     expected_sectors=args.expected_sectors,
                     expected_size=args.sector_size,
                     encoding=args.encoding,
@@ -740,13 +757,30 @@ def main() -> None:
                     continue
                 grouping = group_hard_sectors(
                     track,
-                    sectors_per_rotation=32,
+                    sectors_per_rotation=args.physical_sectors,
                     index_aligned=bool(hdr.flags & 0x01),
                 )
                 if not grouping.groups:
                     continue
                 first_rot = grouping.groups[0]
-                for hole in first_rot:
+
+                def iter_hole_groups():
+                    if args.pair_holes:
+                        limit = len(first_rot) - len(first_rot) % 2
+                        for i in range(0, limit, 2):
+                            h0, h1 = first_rot[i], first_rot[i + 1]
+                            combined = HoleCapture(
+                                hole_index=i // 2,
+                                revolution_indices=h0.revolution_indices
+                                + h1.revolution_indices,
+                                index_ticks=h0.index_ticks + h1.index_ticks,
+                                flux_count=h0.flux_count + h1.flux_count,
+                            )
+                            yield combined
+                    else:
+                        yield from first_rot
+
+                for hole in iter_hole_groups():
                     data = decode_hole_bytes(
                         image,
                         track,
@@ -758,8 +792,30 @@ def main() -> None:
                     )
                     if args.invert_bytes:
                         data = bytes(~b & 0xFF for b in data)
-                    fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bin"
-                    fname.write_bytes(data)
+
+                    raw_name = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bin"
+                    raw_name.write_bytes(data)
+
+                    windows = best_payload_windows(
+                        data, args.sector_size, top_n=max(1, args.payload_windows)
+                    )
+                    if not windows:
+                        fill_ratio, entropy = payload_metrics(data[: args.sector_size])
+                        windows = [(0, data[: args.sector_size], fill_ratio, entropy)]
+                    for win_idx, (offset, payload, fill_ratio, entropy) in enumerate(
+                        windows
+                    ):
+                        payload_label = (
+                            f"track{t:03d}_hole{hole.hole_index:02d}_"
+                            f"win{win_idx}_off{offset:04d}"
+                        )
+                        record_payload(payload_label, payload)
+                        payload_path = outdir / f"{payload_label}.bin"
+                        payload_path.write_bytes(payload)
+                        print(
+                            f"  hole {hole.hole_index:02d} window {win_idx} "
+                            f"off={offset} fill={fill_ratio:.3f} entropy={entropy:.2f}"
+                        )
             print(f"\nWrote hole dumps to {outdir}")
 
     needs_bitcells = bool(
@@ -784,24 +840,24 @@ def main() -> None:
                     continue
                 grouping = group_hard_sectors(
                     track,
-                    sectors_per_rotation=32,
+                    sectors_per_rotation=args.physical_sectors,
                     index_aligned=bool(hdr.flags & 0x01),
                 )
                 if not grouping.groups:
                     continue
                 first_rot = grouping.groups[0]
 
-                def decode_bits_for_hole(hole) -> list[int]:
-                    flux = track.decode_flux(hole.revolution_index)
-                    if args.invert_flux:
-                        flux = list(reversed(flux))
-                    flux_scaled = (
-                        [max(1, int(x * args.clock_scale)) for x in flux]
-                        if args.clock_scale != 1.0
-                        else flux
-                    )
+                def decode_bits_for_hole(hole: HoleCapture) -> list[int]:
+                    flux: list[int] = []
+                    for rev_idx in hole.revolution_indices:
+                        part = track.decode_flux(rev_idx)
+                        if args.invert_flux:
+                            part = list(reversed(part))
+                        if args.clock_scale != 1.0:
+                            part = [max(1, int(x * args.clock_scale)) for x in part]
+                        flux.extend(part)
                     return pll_decode_bits(
-                        flux_scaled,
+                        flux,
                         sample_freq_hz=image.sample_freq_hz,
                         index_ticks=hole.index_ticks,
                         clock_adjust=args.clock_adjust,
@@ -809,26 +865,28 @@ def main() -> None:
                         invert=args.invert_bitcells,
                     )
 
-                hole_iterable = (
-                    [
-                        (first_rot[i], first_rot[i + 1])
-                        for i in range(0, len(first_rot) - 1, 2)
-                    ]
-                    if args.merge_hole_pairs
-                    else [(h,) for h in first_rot]
-                )
-
-                for entry in hole_iterable:
-                    if len(entry) == 2:
-                        h_a, h_b = entry
-                        bits_a = decode_bits_for_hole(h_a)
-                        bits_b = decode_bits_for_hole(h_b)
-                        bits = bits_a + bits_b
-                        label = f"hole{h_a.hole_index:02d}-{h_b.hole_index:02d}"
+                def iter_hole_groups():
+                    if args.pair_holes:
+                        limit = len(first_rot) - len(first_rot) % 2
+                        for i in range(0, limit, 2):
+                            h0, h1 = first_rot[i], first_rot[i + 1]
+                            combined = HoleCapture(
+                                hole_index=i // 2,
+                                revolution_indices=h0.revolution_indices
+                                + h1.revolution_indices,
+                                index_ticks=h0.index_ticks + h1.index_ticks,
+                                flux_count=h0.flux_count + h1.flux_count,
+                            )
+                            yield (
+                                combined,
+                                f"hole{h0.hole_index:02d}-{h1.hole_index:02d}",
+                            )
                     else:
-                        hole = entry[0]
-                        bits = decode_bits_for_hole(hole)
-                        label = f"hole{hole.hole_index:02d}"
+                        for hole in first_rot:
+                            yield hole, f"hole{hole.hole_index:02d}"
+
+                for hole, label in iter_hole_groups():
+                    bits = decode_bits_for_hole(hole)
 
                     if outdir:
                         fname = outdir / f"track{t:03d}_{label}.bits"
@@ -872,7 +930,7 @@ def main() -> None:
                                 f"first (shift {first[0]}, off {first[1]}, val {first[2]:02x}) {preview}"
                             )
                             if payload_dir:
-                                for idx, (shift, off, val, payload) in enumerate(
+                                for _idx, (shift, off, val, payload) in enumerate(
                                     payloads[:payload_cap]
                                 ):
                                     fname = payload_dir / (
@@ -889,7 +947,7 @@ def main() -> None:
                                         f"  ...truncated payload dumps at {payload_cap} entries for {payload_dir}"
                                     )
                             else:
-                                for shift, off, val, payload in payloads[:payload_cap]:
+                                for shift, off, _val, payload in payloads[:payload_cap]:
                                     record_payload(
                                         f"{t}:{label}:mark_shift{shift}_off{off}",
                                         payload,
@@ -959,7 +1017,7 @@ def main() -> None:
                                 patterns=patterns,
                             )
                             if payloads and payload_dir:
-                                for idx, (shift, off, val, payload) in enumerate(
+                                for _idx, (shift, off, val, payload) in enumerate(
                                     payloads[:payload_cap]
                                 ):
                                     fname = payload_dir / (
@@ -971,7 +1029,7 @@ def main() -> None:
                                         payload,
                                     )
                             elif payloads:
-                                for shift, off, val, payload in payloads[:payload_cap]:
+                                for shift, off, _val, payload in payloads[:payload_cap]:
                                     record_payload(
                                         f"{t}:{label}:mark_shift{shift}_off{off}",
                                         payload,

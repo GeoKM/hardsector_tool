@@ -8,8 +8,8 @@ from hardsector_tool.hardsector import (
 )
 from hardsector_tool.scp import RevolutionEntry, SCPImage, TrackData
 
-
 FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
+FIXTURE_221 = Path("tests/ACMS80221/ACMS80221-HS32.scp")
 
 
 def test_grouping_matches_expected_rotations() -> None:
@@ -23,6 +23,28 @@ def test_grouping_matches_expected_rotations() -> None:
     assert len(grouping.groups[0]) == 32
     assert grouping.groups[0][0].hole_index == 0
     assert sum(len(h.revolution_indices) for h in grouping.groups[0]) == 33
+
+
+def test_detects_short_pair_position() -> None:
+    image = SCPImage.from_file(FIXTURE)
+    track = image.read_track(0)
+    assert track is not None
+
+    grouping = group_hard_sectors(track, sectors_per_rotation=32)
+    assert grouping.short_pair_positions is not None
+    assert grouping.short_pair_positions[0] == 14
+    assert len(grouping.groups[0]) == 32
+    assert sum(len(h.revolution_indices) for h in grouping.groups[0]) == 33
+
+
+def test_short_pair_position_other_fixture() -> None:
+    image = SCPImage.from_file(FIXTURE_221)
+    track = image.read_track(0)
+    assert track is not None
+
+    grouping = group_hard_sectors(track, sectors_per_rotation=32)
+    assert grouping.short_pair_positions is not None
+    assert grouping.short_pair_positions[0] == 28
 
 
 def test_best_sector_map_prefers_crc_ok() -> None:

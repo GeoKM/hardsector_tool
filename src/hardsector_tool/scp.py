@@ -12,7 +12,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 SAMPLE_FREQ_HZ = 40_000_000  # SCP captures at 40 MHz (25 ns ticks)
 TRACK_OFFSET_COUNT = 168
