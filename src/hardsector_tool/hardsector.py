@@ -10,6 +10,7 @@ intervals per rotation.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from statistics import median
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -50,6 +51,7 @@ class HardSectorGrouping:
     rotated_by: int = 0
     index_confidence: float = 0.0
     index_aligned_flag: Optional[bool] = None
+    short_pair_positions: List[Optional[int]] | None = None
 
     @property
     def rotations(self) -> int:
@@ -61,6 +63,47 @@ FORMAT_PRESETS = {
     "cpm-26x128": {"expected_sectors": 26, "sector_size": 128, "encoding": "fm"},
     "ibm-9x512-mfm": {"expected_sectors": 9, "sector_size": 512, "encoding": "mfm"},
 }
+
+FILL_BYTES = {0xFF, 0xFE, 0xFB, 0xF7, 0xEF, 0xDF, 0xFD, 0xBF, 0x7F}
+
+
+def payload_metrics(data: bytes) -> tuple[float, float]:
+    if not data:
+        return 1.0, 0.0
+    fill_ratio = sum(1 for b in data if b in FILL_BYTES) / len(data)
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    entropy = 0.0
+    for count in freq:
+        if count:
+            p = count / len(data)
+            entropy -= p * math.log2(p)
+    return fill_ratio, entropy
+
+
+def best_payload_windows(
+    data: bytes, window_size: int, top_n: int = 1
+) -> list[tuple[int, bytes, float, float]]:
+    """
+    Return the top-N windows ranked by lowest fill ratio then highest entropy.
+    """
+
+    if window_size <= 0 or not data:
+        return []
+
+    results: list[tuple[float, float, int, bytes]] = []
+    for start in range(0, max(1, len(data) - window_size + 1)):
+        window = data[start : start + window_size]
+        fill, entropy = payload_metrics(window)
+        results.append((fill, -entropy, start, window))
+
+    results.sort()
+    trimmed = results[:top_n]
+    return [
+        (start, window, fill, -entropy_neg)
+        for fill, entropy_neg, start, window in trimmed
+    ]
 
 
 def _detect_index_hole_offset(
@@ -89,42 +132,40 @@ def _rotate_list(values: Sequence, offset: int) -> list:
 
 def _merge_index_splits(
     revs: Sequence[RevolutionEntry], ordered_indices: Sequence[int]
-) -> list[tuple[tuple[int, ...], int, int]]:
+) -> tuple[list[tuple[tuple[int, ...], int, int]], Optional[int]]:
     """
     Merge the two shortest, adjacent holes (index split) into one interval.
 
-    Returns a list of tuples: (revolution_indices, combined_index_ticks, combined_flux_count).
-    If no adjacent minimum pair is found, the original ordering is preserved.
+    Returns (merged_entries, short_pair_start) where merged_entries is a list of
+    tuples: (revolution_indices, combined_index_ticks, combined_flux_count).
+    If no adjacent minimum pair is found, the original ordering is preserved and
+    short_pair_start is None.
     """
 
     if len(revs) < 3:
-        return [
+        merged = [
             ((ordered_indices[i],), revs[i].index_ticks, revs[i].flux_count)
             for i in range(len(revs))
         ]
+        return merged, None
 
-    shortest = sorted(range(len(revs)), key=lambda i: revs[i].index_ticks)[:2]
-    shortest.sort()
+    med = median(r.index_ticks for r in revs)
+    cutoff = med * 0.75 if med else 0
+    candidates: list[tuple[int, int]] = []
+    for idx, rev in enumerate(revs):
+        nxt = (idx + 1) % len(revs)
+        if rev.index_ticks < cutoff and revs[nxt].index_ticks < cutoff:
+            candidates.append((rev.index_ticks + revs[nxt].index_ticks, idx))
 
-    def adjacent(a: int, b: int) -> bool:
-        return abs(a - b) == 1 or {a, b} == {0, len(revs) - 1}
-
+    short_pair_start = min(candidates)[1] if candidates else None
     merged: list[tuple[tuple[int, ...], int, int]] = []
-    merged_pair = tuple(shortest) if adjacent(shortest[0], shortest[1]) else None
-    merged_set = set(merged_pair) if merged_pair else set()
     visited: set[int] = set()
+
     for idx in range(len(revs)):
         if idx in visited:
             continue
-        partner: int | None = None
-        if merged_pair and idx in merged_set:
-            forward = (idx + 1) % len(revs)
-            backward = (idx - 1) % len(revs)
-            if forward in merged_set and forward not in visited:
-                partner = forward
-            elif backward in merged_set and backward not in visited:
-                partner = backward
-        if partner is not None:
+        if short_pair_start is not None and idx == short_pair_start:
+            partner = (idx + 1) % len(revs)
             indices = (ordered_indices[idx], ordered_indices[partner])
             merged_ticks = revs[idx].index_ticks + revs[partner].index_ticks
             merged_flux = revs[idx].flux_count + revs[partner].flux_count
@@ -135,7 +176,8 @@ def _merge_index_splits(
             ((ordered_indices[idx],), revs[idx].index_ticks, revs[idx].flux_count)
         )
         visited.add(idx)
-    return merged
+
+    return merged, short_pair_start
 
 
 def group_hard_sectors(
@@ -158,6 +200,7 @@ def group_hard_sectors(
     confidence = 0.0
 
     groups: List[List[HoleCapture]] = []
+    short_pairs: List[Optional[int]] = []
     for rot_idx, base in enumerate(range(0, len(revs), holes_per_rotation)):
         chunk = revs[base : base + holes_per_rotation]
         if len(chunk) < holes_per_rotation:
@@ -175,7 +218,8 @@ def group_hard_sectors(
             chunk = _rotate_list(chunk, offset)
             chunk_indices = _rotate_list(chunk_indices, offset)
 
-        merged = _merge_index_splits(chunk, chunk_indices)
+        merged, short_pair = _merge_index_splits(chunk, chunk_indices)
+        short_pairs.append(short_pair)
         captures: List[HoleCapture] = []
         for idx, (rev_indices, ticks, flux_count) in enumerate(merged):
             captures.append(
@@ -193,6 +237,7 @@ def group_hard_sectors(
         rotated_by=rotated_by,
         index_confidence=confidence,
         index_aligned_flag=index_aligned,
+        short_pair_positions=short_pairs,
     )
 
 
@@ -413,10 +458,14 @@ def assemble_rotation(
                 initial_clock_ticks=initial_clock,
                 clock_adjust=clock_adjust,
             )
-            payload = raw[:expected_size]
+            windows = best_payload_windows(raw, expected_size, top_n=1)
+            if windows:
+                offset, payload, _, _ = windows[0]
+            else:
+                offset, payload = 0, raw[:expected_size]
             guesses.append(
                 SectorGuess(
-                    offset=0,
+                    offset=offset,
                     track=track.track_number,
                     head=0,
                     sector_id=hole.hole_index % expected_sectors,

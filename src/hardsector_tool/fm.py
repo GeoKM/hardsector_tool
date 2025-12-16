@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 DEFAULT_CLOCK_ADJ = 0.10
 PLL_PERIOD_ADJ = 0.05
@@ -116,7 +116,6 @@ def find_sync_bytes(
     missing clock (i.e., a repeated '0') within the last two bitcells.
     """
     indices: List[int] = []
-    target = f"{pattern:08b}"
     for i in range(0, max(0, len(bits) - 8)):
         window_bits = bits[i : i + 8]
         as_byte = 0
@@ -201,14 +200,13 @@ def decode_fm_bits(flux: Sequence[int], threshold: float | None = None) -> List[
         if span >= use_threshold:
             bits.append(0)
             i += 1
+        # Attempt to pair with the next short span to represent a data 1.
+        elif i + 1 < len(flux) and flux[i + 1] < use_threshold * 1.2:
+            bits.append(1)
+            i += 2
         else:
-            # Attempt to pair with the next short span to represent a data 1.
-            if i + 1 < len(flux) and flux[i + 1] < use_threshold * 1.2:
-                bits.append(1)
-                i += 2
-            else:
-                bits.append(0)
-                i += 1
+            bits.append(0)
+            i += 1
     return bits
 
 
@@ -359,6 +357,10 @@ def pll_decode_fm_bytes(
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
     invert: bool = False,
 ) -> PLLDecodeResult:
+    """
+    Decode FM by PLL to bitcells, then map clock/data phases into bytes.
+    """
+
     bitcells = pll_decode_bits(
         flux,
         sample_freq_hz,
@@ -380,24 +382,36 @@ def pll_decode_fm_bytes(
 
 def fm_bytes_from_bitcells(bitcells: Sequence[int]) -> Tuple[int, bytes]:
     """
-    Derive FM data bytes from bitcell transitions by selecting the phase
-    with the densest clock bits and using the opposite phase for data bits.
+    Convert PLL bitcells into FM data bytes.
+
+    We try both possible clock/data phases, prefer the one with denser clock
+    transitions, and then apply byte-alignment heuristics to the resulting
+    data-bit stream.
     """
+
     if not bitcells:
         return 0, b""
+
     best_phase = 0
-    best_clock_score = -1
+    best_shift = 0
     best_bytes = b""
+    best_score: Tuple[int, float, int] = (-1, -math.inf, 0)
+
     for phase in (0, 1):
         clock_bits = bitcells[phase::2]
         data_bits = bitcells[1 - phase :: 2]
         clock_score = sum(clock_bits)
-        as_bytes = bits_to_bytes(data_bits)
-        if clock_score > best_clock_score:
-            best_clock_score = clock_score
+        shift, aligned = best_aligned_bytes(data_bits)
+        entropy = _entropy(aligned)
+        score = (clock_score, entropy, -_longest_constant_run(aligned))
+        if score > best_score:
+            best_score = score
             best_phase = phase
-            best_bytes = as_bytes
-    return best_phase, best_bytes
+            best_shift = shift
+            best_bytes = aligned
+
+    overall_shift = (1 - best_phase + best_shift) % 8
+    return overall_shift, best_bytes
 
 
 def brute_force_mark_payloads(
@@ -455,26 +469,52 @@ def scan_fm_sectors(
     Data fields are located by searching for a DAM (0xFB/0xFA/0xF8) within
     `search_window` bytes after the IDAM CRC.
     """
+    gap_bytes = {0xFF, 0x00, 0x4E, 0xA1}
     guesses: List[SectorGuess] = []
     i = 0
+
+    def has_gap_leadin(offset: int, min_run: int = 6) -> bool:
+        window = byte_stream[max(0, offset - 2 * min_run) : offset]
+        if not window:
+            return False
+        run = 0
+        for b in reversed(window):
+            if b in gap_bytes:
+                run += 1
+            else:
+                break
+        return run >= min_run
+
     while i < len(byte_stream) - 8:
-        if byte_stream[i] != 0xFE:
+        mark = byte_stream[i]
+        if mark != 0xFE:
             i += 1
             continue
-        if require_sync:
-            window = byte_stream[max(0, i - 3) : i]
-            if not any(sb in window for sb in sync_bytes):
-                i += 1
-                continue
+
+        if not has_gap_leadin(i):
+            i += 1
+            continue
+
         if i + 6 >= len(byte_stream):
             break
+
+        if require_sync:
+            sync_window = byte_stream[max(0, i - 3) : i]
+            if not any(sb in sync_window for sb in sync_bytes):
+                i += 1
+                continue
+
         track, head, sector_id, size_code = (
             byte_stream[i + 1],
             byte_stream[i + 2],
             byte_stream[i + 3],
             byte_stream[i + 4],
         )
-        expected_len = 128 << size_code if size_code < 7 else 0
+        if size_code >= 7:
+            i += 1
+            continue
+
+        expected_len = 128 << size_code
         id_crc_val = int.from_bytes(byte_stream[i + 5 : i + 7], "big")
         id_crc_ok = crc16_ibm(byte_stream[i : i + 5]) == id_crc_val
 
@@ -484,15 +524,16 @@ def scan_fm_sectors(
         search_start = i + 7
         search_end = min(len(byte_stream), search_start + search_window)
         for pos in range(search_start, search_end):
-            if byte_stream[pos] in dam_bytes:
-                dam_pos = pos
-                if require_sync:
-                    sync_win = byte_stream[max(0, pos - 3) : pos]
-                    if not any(sb in sync_win for sb in sync_bytes):
-                        dam_pos = None
-                        continue
-                break
-        if dam_pos is not None and expected_len:
+            if byte_stream[pos] not in dam_bytes:
+                continue
+            if require_sync:
+                sync_win = byte_stream[max(0, pos - 3) : pos]
+                if not any(sb in sync_win for sb in sync_bytes):
+                    continue
+            dam_pos = pos
+            break
+
+        if dam_pos is not None:
             data_start = dam_pos + 1
             data_end = data_start + expected_len + 2
             if data_end <= len(byte_stream):
@@ -500,7 +541,6 @@ def scan_fm_sectors(
                 data_crc_val = int.from_bytes(
                     byte_stream[data_end - 2 : data_end], "big"
                 )
-                # Data CRC includes DAM byte in FM
                 data_crc_ok = (
                     crc16_ibm(byte_stream[dam_pos : data_end - 2]) == data_crc_val
                 )
@@ -520,4 +560,5 @@ def scan_fm_sectors(
             )
         )
         i += 1
+
     return guesses

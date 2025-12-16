@@ -3,18 +3,16 @@ from pathlib import Path
 from hardsector_tool.fm import (
     best_aligned_bytes,
     brute_force_mark_payloads,
-    decode_fm_bytes,
-    decode_mfm_bytes,
-    fm_bytes_from_bitcells,
-    estimate_cell_ticks,
-    pll_decode_fm_bytes,
-    pll_decode_bits,
-    scan_fm_sectors,
-    mfm_bytes_from_bitcells,
     crc16_ibm,
+    decode_fm_bytes,
+    estimate_cell_ticks,
+    fm_bytes_from_bitcells,
+    mfm_bytes_from_bitcells,
+    pll_decode_bits,
+    pll_decode_fm_bytes,
+    scan_fm_sectors,
 )
 from hardsector_tool.scp import SCPImage
-
 
 FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
 
@@ -81,7 +79,8 @@ def test_scan_fm_sectors_locates_dam() -> None:
     id_crc = crc16_ibm(id_header)
     data_crc = crc16_ibm(bytes([0xFB]) + data)
     stream = (
-        b"\x00\x00\xa1"  # padding + sync
+        b"\xff" * 8
+        + b"\xa1"  # padding + sync
         + id_header
         + id_crc.to_bytes(2, "big")
         + b"\x00\x00\x00\xa1"
@@ -94,6 +93,12 @@ def test_scan_fm_sectors_locates_dam() -> None:
     guess = guesses[0]
     assert guess.data_crc_ok and guess.id_crc_ok
     assert guess.data == data
+
+
+def test_scan_fm_sectors_needs_gap() -> None:
+    # Lone FE in Z80-like code should not be treated as IDAM without a gap.
+    random_stream = bytes([0xC3, 0x12, 0x34, 0xFE, 0x56, 0x78, 0x9A])
+    assert scan_fm_sectors(random_stream) == []
 
 
 def test_mfm_bitcell_roundtrip() -> None:
