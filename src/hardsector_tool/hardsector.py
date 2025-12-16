@@ -110,6 +110,37 @@ def decode_hole(
     return sectors[0] if sectors else None
 
 
+def decode_hole_bytes(
+    image: SCPImage,
+    track: TrackData,
+    hole_capture: HoleCapture,
+    use_pll: bool = False,
+    encoding: str = "fm",
+    initial_clock_ticks: float | None = None,
+) -> bytes:
+    """
+    Decode one hole's flux and return raw decoded bytes without sector framing.
+    """
+    flux = track.decode_flux(hole_capture.revolution_index)
+    if encoding.lower() == "mfm":
+        decoded = decode_mfm_bytes(
+            flux,
+            sample_freq_hz=image.sample_freq_hz,
+            index_ticks=hole_capture.index_ticks,
+            initial_clock_ticks=initial_clock_ticks,
+        )
+        return decoded.bytes_out
+    if use_pll:
+        decoded = pll_decode_fm_bytes(
+            flux,
+            sample_freq_hz=image.sample_freq_hz,
+            index_ticks=hole_capture.index_ticks,
+            initial_clock_ticks=initial_clock_ticks,
+        )
+        return decoded.bytes_out
+    return decode_fm_bytes(flux).bytes_out
+
+
 def assemble_rotation(
     image: SCPImage,
     track: TrackData,
@@ -119,6 +150,9 @@ def assemble_rotation(
     require_sync: bool = False,
     encoding: str = "fm",
     calibrate_rotation: bool = False,
+    synthetic_from_hole: bool = False,
+    expected_sectors: int = 16,
+    expected_size: int = 256,
 ) -> List[SectorGuess]:
     """
     Decode all holes in a given rotation and return any sector guesses found.
@@ -142,8 +176,33 @@ def assemble_rotation(
             encoding=encoding,
             initial_clock_ticks=initial_clock,
         )
-        if guess:
+        if guess and guess.length:
             guesses.append(guess)
+            continue
+        if synthetic_from_hole:
+            raw = decode_hole_bytes(
+                image,
+                track,
+                hole,
+                use_pll=use_pll,
+                encoding=encoding,
+                initial_clock_ticks=initial_clock,
+            )
+            payload = raw[:expected_size]
+            guesses.append(
+                SectorGuess(
+                    offset=0,
+                    track=track.track_number,
+                    head=0,
+                    sector_id=hole.hole_index % expected_sectors,
+                    size_code=0,
+                    length=len(payload),
+                    crc_ok=False,
+                    id_crc_ok=False,
+                    data_crc_ok=False,
+                    data=payload,
+                )
+            )
     return guesses
 
 
@@ -157,6 +216,7 @@ def decode_track_best_map(
     use_pll: bool = False,
     require_sync: bool = False,
     calibrate_rotation: bool = False,
+    synthetic_from_holes: bool = False,
 ) -> Dict[int, SectorGuess]:
     track = image.read_track(track_number)
     if not track:
@@ -172,6 +232,9 @@ def decode_track_best_map(
             require_sync=require_sync,
             encoding=encoding,
             calibrate_rotation=calibrate_rotation,
+            synthetic_from_hole=synthetic_from_holes,
+            expected_sectors=expected_sectors,
+            expected_size=expected_size,
         )
         for r in range(grouping.rotations)
     ]

@@ -156,6 +156,11 @@ def main() -> None:
         help="Calibrate PLL clock from the first hole in each rotation.",
     )
     parser.add_argument(
+        "--synthetic-from-holes",
+        action="store_true",
+        help="If no IDAMs are found, synthesize sectors from hole payloads (mod expected sector count).",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -292,6 +297,9 @@ def main() -> None:
                 require_sync=args.require_sync,
                 encoding=args.encoding,
                 calibrate_rotation=args.calibrate_rotation,
+                synthetic_from_hole=args.synthetic_from_holes,
+                expected_sectors=args.expected_sectors,
+                expected_size=args.sector_size,
             )
             if guesses:
                 print(f"\nRotation {rotation} sector guesses (first 16):")
@@ -311,6 +319,9 @@ def main() -> None:
                         require_sync=args.require_sync,
                         encoding=args.encoding,
                         calibrate_rotation=args.calibrate_rotation,
+                        synthetic_from_hole=args.synthetic_from_holes,
+                        expected_sectors=args.expected_sectors,
+                        expected_size=args.sector_size,
                     )
                     for r in range(grouping.rotations)
                 ]
@@ -354,6 +365,7 @@ def main() -> None:
                 use_pll=args.use_pll,
                 require_sync=args.require_sync,
                 calibrate_rotation=args.calibrate_rotation,
+                synthetic_from_holes=args.synthetic_from_holes,
             )
             track_maps[t] = best_map
         raw = build_raw_image(
