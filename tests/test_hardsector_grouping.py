@@ -1,7 +1,11 @@
 from pathlib import Path
 
-from hardsector_tool.hardsector import FORMAT_PRESETS, best_sector_map, group_hard_sectors
-from hardsector_tool.fm import scan_fm_sectors
+from hardsector_tool.hardsector import (
+    FORMAT_PRESETS,
+    best_sector_map,
+    build_raw_image,
+    group_hard_sectors,
+)
 from hardsector_tool.scp import SCPImage
 
 
@@ -42,3 +46,14 @@ def test_presets_include_cpm_defaults() -> None:
     assert preset["expected_sectors"] == 16
     assert preset["sector_size"] == 256
     assert preset["encoding"] == "fm"
+
+
+def test_build_raw_image_fills_missing() -> None:
+    fake_guess = type(
+        "G",
+        (),
+        {"data": b"A" * 4, "track": 0, "head": 0, "sector_id": 0, "length": 4, "crc_ok": True},
+    )
+    track_maps = {0: {0: fake_guess}}
+    raw = build_raw_image(track_maps, track_order=[0], expected_sectors=2, expected_size=4, fill_byte=0x45)
+    assert raw == b"AAAA" + bytes([0x45]) * 4

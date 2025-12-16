@@ -25,6 +25,8 @@ from hardsector_tool.hardsector import (
     best_sector_map,
     decode_hole,
     group_hard_sectors,
+    decode_track_best_map,
+    build_raw_image,
 )
 from hardsector_tool.scp import SCPImage
 
@@ -158,6 +160,12 @@ def main() -> None:
         type=Path,
         default=None,
         help="Directory to write decoded sectors from the best map (implies --sector-map).",
+    )
+    parser.add_argument(
+        "--image-out",
+        type=Path,
+        default=None,
+        help="Write a flat image assembled from best sector maps across tracks.",
     )
     parser.add_argument(
         "--require-sync",
@@ -331,6 +339,33 @@ def main() -> None:
                         fname = outdir / f"track{tracks[0]:02d}_head0_sector{sid:02d}.bin"
                         fname.write_bytes(g.data)
                         print(f"  wrote {fname} ({len(g.data)} bytes)")
+
+    # Whole-disk pass: assemble best sector maps across all present tracks.
+    if args.image_out:
+        track_maps = {}
+        for t in present_tracks:
+            best_map = decode_track_best_map(
+                image,
+                t,
+                sectors_per_rotation=32,
+                expected_sectors=args.expected_sectors,
+                expected_size=args.sector_size,
+                encoding=args.encoding,
+                use_pll=args.use_pll,
+                require_sync=args.require_sync,
+                calibrate_rotation=args.calibrate_rotation,
+            )
+            track_maps[t] = best_map
+        raw = build_raw_image(
+            track_maps,
+            track_order=list(present_tracks),
+            expected_sectors=args.expected_sectors,
+            expected_size=args.sector_size,
+            fill_byte=0x00,
+        )
+        args.image_out.parent.mkdir(parents=True, exist_ok=True)
+        args.image_out.write_bytes(raw)
+        print(f"\nWrote assembled image to {args.image_out} ({len(raw)} bytes)")
 
 
 if __name__ == "__main__":

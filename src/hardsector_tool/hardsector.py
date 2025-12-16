@@ -147,6 +147,68 @@ def assemble_rotation(
     return guesses
 
 
+def decode_track_best_map(
+    image: SCPImage,
+    track_number: int,
+    sectors_per_rotation: int = 32,
+    expected_sectors: int = 16,
+    expected_size: int = 256,
+    encoding: str = "fm",
+    use_pll: bool = False,
+    require_sync: bool = False,
+    calibrate_rotation: bool = False,
+) -> Dict[int, SectorGuess]:
+    track = image.read_track(track_number)
+    if not track:
+        return {}
+    grouping = group_hard_sectors(track, sectors_per_rotation=sectors_per_rotation)
+    all_rotations = [
+        assemble_rotation(
+            image,
+            track,
+            grouping,
+            r,
+            use_pll=use_pll,
+            require_sync=require_sync,
+            encoding=encoding,
+            calibrate_rotation=calibrate_rotation,
+        )
+        for r in range(grouping.rotations)
+    ]
+    return best_sector_map(
+        all_rotations,
+        expected_track=track_number,
+        expected_head=0,
+        expected_sector_count=expected_sectors,
+        expected_size=expected_size,
+    )
+
+
+def build_raw_image(
+    track_maps: Dict[int, Dict[int, SectorGuess]],
+    track_order: List[int],
+    expected_sectors: int,
+    expected_size: int,
+    fill_byte: int = 0x00,
+) -> bytes:
+    """
+    Assemble a flat image from per-track sector maps.
+
+    Missing sectors are filled with the given fill_byte.
+    """
+    fill_block = bytes([fill_byte]) * expected_size
+    parts: List[bytes] = []
+    for track_num in track_order:
+        sector_map = track_maps.get(track_num, {})
+        for sid in range(expected_sectors):
+            guess = sector_map.get(sid)
+            if guess and guess.data:
+                parts.append(guess.data)
+            else:
+                parts.append(fill_block)
+    return b"".join(parts)
+
+
 def best_sector_map(
     rotations: List[List[SectorGuess]],
     expected_track: int,
