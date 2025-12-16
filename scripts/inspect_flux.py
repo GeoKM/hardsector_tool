@@ -13,8 +13,14 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
-from hardsector_tool.fm import decode_fm_bytes, pll_decode_fm_bytes, scan_fm_sectors
+from hardsector_tool.fm import (
+    decode_fm_bytes,
+    decode_mfm_bytes,
+    pll_decode_fm_bytes,
+    scan_fm_sectors,
+)
 from hardsector_tool.hardsector import (
+    FORMAT_PRESETS,
     assemble_rotation,
     best_sector_map,
     decode_hole,
@@ -137,6 +143,17 @@ def main() -> None:
         help="Expected sector size in bytes.",
     )
     parser.add_argument(
+        "--preset",
+        choices=["auto"] + sorted(FORMAT_PRESETS.keys()),
+        default="auto",
+        help="Use a predefined format preset (overrides encoding/sector counts).",
+    )
+    parser.add_argument(
+        "--calibrate-rotation",
+        action="store_true",
+        help="Calibrate PLL clock from the first hole in each rotation.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -148,6 +165,12 @@ def main() -> None:
         help="Require an 0xA1 sync byte before IDAM when scanning sectors.",
     )
     args = parser.parse_args()
+
+    if args.preset != "auto":
+        preset = FORMAT_PRESETS[args.preset]
+        args.expected_sectors = preset["expected_sectors"]
+        args.sector_size = preset["sector_size"]
+        args.encoding = preset["encoding"]
 
     image = SCPImage.from_file(args.scp_path)
     hdr = image.header
@@ -205,7 +228,7 @@ def main() -> None:
             return
         flux = track.decode_flux(rev_index)
         if args.encoding == "mfm":
-            result = pll_decode_fm_bytes(
+            result = decode_mfm_bytes(
                 flux, sample_freq_hz=image.sample_freq_hz, index_ticks=track.revolutions[0].index_ticks
             )
             meta = f"MFM via PLL (bit shift {result.bit_shift})"
@@ -260,6 +283,7 @@ def main() -> None:
                 use_pll=args.use_pll,
                 require_sync=args.require_sync,
                 encoding=args.encoding,
+                calibrate_rotation=args.calibrate_rotation,
             )
             if guesses:
                 print(f"\nRotation {rotation} sector guesses (first 16):")
@@ -278,6 +302,7 @@ def main() -> None:
                         use_pll=args.use_pll,
                         require_sync=args.require_sync,
                         encoding=args.encoding,
+                        calibrate_rotation=args.calibrate_rotation,
                     )
                     for r in range(grouping.rotations)
                 ]

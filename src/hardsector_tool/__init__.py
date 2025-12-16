@@ -27,6 +27,7 @@ from .hardsector import (
     HoleCapture,
     best_sector_map,
     decode_hole,
+    FORMAT_PRESETS,
     group_hard_sectors,
 )
 from .scp import SCPImage, SCPHeader, TrackData, RevolutionEntry
@@ -57,6 +58,7 @@ __all__ = [
     "group_hard_sectors",
     "decode_hole",
     "best_sector_map",
+    "FORMAT_PRESETS",
 ]
 
 __version__ = "0.0.1"

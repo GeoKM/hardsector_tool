@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from hardsector_tool.hardsector import best_sector_map, group_hard_sectors
+from hardsector_tool.hardsector import FORMAT_PRESETS, best_sector_map, group_hard_sectors
 from hardsector_tool.fm import scan_fm_sectors
 from hardsector_tool.scp import SCPImage
 
@@ -35,3 +35,10 @@ def test_best_sector_map_prefers_crc_ok() -> None:
     )
     best = best_sector_map([[g_bad], [g_ok]], expected_track=0, expected_head=0)
     assert best[1] is g_ok
+
+
+def test_presets_include_cpm_defaults() -> None:
+    preset = FORMAT_PRESETS["cpm-16x256"]
+    assert preset["expected_sectors"] == 16
+    assert preset["sector_size"] == 256
+    assert preset["encoding"] == "fm"

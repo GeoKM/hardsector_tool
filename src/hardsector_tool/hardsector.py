@@ -16,6 +16,7 @@ from .fm import (
     SectorGuess,
     decode_fm_bytes,
     decode_mfm_bytes,
+    estimate_cell_ticks,
     pll_decode_fm_bytes,
     scan_fm_sectors,
 )
@@ -39,6 +40,13 @@ class HardSectorGrouping:
     @property
     def rotations(self) -> int:
         return len(self.groups)
+
+
+FORMAT_PRESETS = {
+    "cpm-16x256": {"expected_sectors": 16, "sector_size": 256, "encoding": "fm"},
+    "cpm-26x128": {"expected_sectors": 26, "sector_size": 128, "encoding": "fm"},
+    "ibm-9x512-mfm": {"expected_sectors": 9, "sector_size": 512, "encoding": "mfm"},
+}
 
 
 def group_hard_sectors(track: TrackData, sectors_per_rotation: int = 32) -> HardSectorGrouping:
@@ -72,6 +80,7 @@ def decode_hole(
     use_pll: bool = False,
     require_sync: bool = False,
     encoding: str = "fm",
+    initial_clock_ticks: float | None = None,
 ) -> Optional[SectorGuess]:
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
@@ -82,17 +91,22 @@ def decode_hole(
             flux,
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
+            initial_clock_ticks=initial_clock_ticks,
         )
     elif use_pll:
         decoded = pll_decode_fm_bytes(
             flux,
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=hole_capture.index_ticks,
+            initial_clock_ticks=initial_clock_ticks,
         )
     else:
         decoded = decode_fm_bytes(flux)
 
-    sectors = scan_fm_sectors(decoded.bytes_out, require_sync=require_sync)
+    sync_bytes = (0xA1, 0x4E) if encoding.lower() == "mfm" else (0xA1,)
+    sectors = scan_fm_sectors(
+        decoded.bytes_out, require_sync=require_sync, sync_bytes=sync_bytes
+    )
     return sectors[0] if sectors else None
 
 
@@ -104,6 +118,7 @@ def assemble_rotation(
     use_pll: bool = False,
     require_sync: bool = False,
     encoding: str = "fm",
+    calibrate_rotation: bool = False,
 ) -> List[SectorGuess]:
     """
     Decode all holes in a given rotation and return any sector guesses found.
@@ -111,6 +126,12 @@ def assemble_rotation(
     if rotation_index >= grouping.rotations:
         return []
     guesses: List[SectorGuess] = []
+    initial_clock = None
+    if calibrate_rotation and grouping.groups[rotation_index]:
+        first_flux = track.decode_flux(grouping.groups[rotation_index][0].revolution_index)
+        half, _, _ = estimate_cell_ticks(first_flux)
+        initial_clock = half * 2
+
     for hole in grouping.groups[rotation_index]:
         guess = decode_hole(
             image,
@@ -119,6 +140,7 @@ def assemble_rotation(
             use_pll=use_pll,
             require_sync=require_sync,
             encoding=encoding,
+            initial_clock_ticks=initial_clock,
         )
         if guess:
             guesses.append(guess)

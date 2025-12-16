@@ -133,11 +133,17 @@ def decode_mfm_bytes(
     flux: Sequence[int],
     sample_freq_hz: float,
     index_ticks: int | None = None,
+    initial_clock_ticks: float | None = None,
 ) -> MFMDecodeResult:
     """
     Decode MFM data by PLL to bitcells then collapsing alternating clock/data bits.
     """
-    bitcells = pll_decode_bits(flux, sample_freq_hz, index_ticks=index_ticks)
+    bitcells = pll_decode_bits(
+        flux,
+        sample_freq_hz,
+        index_ticks=index_ticks,
+        initial_clock_ticks=initial_clock_ticks,
+    )
     shift, decoded = mfm_bytes_from_bitcells(bitcells)
     return MFMDecodeResult(bytes_out=decoded, bit_shift=shift)
 
@@ -218,6 +224,7 @@ def pll_decode_bits(
     sample_freq_hz: float,
     index_ticks: int | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    initial_clock_ticks: float | None = None,
 ) -> List[int]:
     """
     Decode flux intervals into bitcells using a simple PLL.
@@ -230,7 +237,8 @@ def pll_decode_bits(
         return []
 
     half_med, _, _ = estimate_cell_ticks(flux)
-    clock = (half_med * 2) / sample_freq_hz
+    clock_ticks = initial_clock_ticks if initial_clock_ticks else half_med * 2
+    clock = clock_ticks / sample_freq_hz
     clock_min = clock * (1 - clock_adjust)
     clock_max = clock * (1 + clock_adjust)
     ticks = 0.0
@@ -273,11 +281,17 @@ def pll_decode_fm_bytes(
     flux: Sequence[int],
     sample_freq_hz: float,
     index_ticks: int | None = None,
+    initial_clock_ticks: float | None = None,
 ) -> PLLDecodeResult:
-    bitcells = pll_decode_bits(flux, sample_freq_hz, index_ticks=index_ticks)
+    bitcells = pll_decode_bits(
+        flux,
+        sample_freq_hz,
+        index_ticks=index_ticks,
+        initial_clock_ticks=initial_clock_ticks,
+    )
     shift, decoded = best_aligned_bytes(bitcells)
     half_med, _, _ = estimate_cell_ticks(flux)
-    clock_ticks = half_med * 2
+    clock_ticks = initial_clock_ticks if initial_clock_ticks else half_med * 2
     return PLLDecodeResult(
         bytes_out=decoded,
         bit_shift=shift,
@@ -301,7 +315,11 @@ def crc16_ibm(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def scan_fm_sectors(byte_stream: bytes, require_sync: bool = False) -> List[SectorGuess]:
+def scan_fm_sectors(
+    byte_stream: bytes,
+    require_sync: bool = False,
+    sync_bytes: Sequence[int] = (0xA1,),
+) -> List[SectorGuess]:
     """
     Heuristically scan for FM address marks (0xFE) and data fields.
 
@@ -315,7 +333,11 @@ def scan_fm_sectors(byte_stream: bytes, require_sync: bool = False) -> List[Sect
         if byte_stream[i] != 0xFE:
             i += 1
             continue
-        if require_sync and 0xA1 not in byte_stream[max(0, i - 3) : i]:
+        if require_sync:
+            window = byte_stream[max(0, i - 3) : i]
+            if not any(sb in window for sb in sync_bytes):
+                i += 1
+                continue
             i += 1
             continue
         if i + 6 >= len(byte_stream):
