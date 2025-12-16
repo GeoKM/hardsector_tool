@@ -19,6 +19,8 @@ from hardsector_tool.fm import (
     bits_to_bytes,
     decode_fm_bytes,
     decode_mfm_bytes,
+    fm_bytes_from_bitcells,
+    mfm_bytes_from_bitcells,
     pll_decode_fm_bytes,
     pll_decode_bits,
     scan_data_marks,
@@ -29,11 +31,13 @@ from hardsector_tool.hardsector import (
     FORMAT_PRESETS,
     assemble_rotation,
     best_sector_map,
+    compute_flux_index_deltas,
     decode_hole,
     decode_hole_bytes,
     group_hard_sectors,
     decode_track_best_map,
     build_raw_image,
+    stitch_rotation_flux,
 )
 from hardsector_tool.scp import SCPImage
 
@@ -133,6 +137,11 @@ def main() -> None:
         "--hard-sector-summary",
         action="store_true",
         help="Summarize hard-sector groupings (assumes 32 holes + index).",
+    )
+    parser.add_argument(
+        "--flux-deltas",
+        action="store_true",
+        help="Report index_ticks minus summed flux per hole for the first selected track.",
     )
     parser.add_argument(
         "--hole",
@@ -247,6 +256,11 @@ def main() -> None:
         help="Invert PLL bitcells before byte conversion (useful if polarity is reversed).",
     )
     parser.add_argument(
+        "--invert-flux",
+        action="store_true",
+        help="Invert flux intervals prior to PLL (experimental polarity check).",
+    )
+    parser.add_argument(
         "--merge-hole-pairs",
         action="store_true",
         help="Concatenate consecutive hole bitstreams (0+1, 2+3, ...) before scanning/dumping.",
@@ -285,6 +299,16 @@ def main() -> None:
         help="When bruteforcing mark payloads without hits, try windows every N bits (default 2048).",
     )
     parser.add_argument(
+        "--stitch-rotation",
+        action="store_true",
+        help="Also decode a stitched full-rotation bitstream before scanning/dumping.",
+    )
+    parser.add_argument(
+        "--stitch-gap-comp",
+        action="store_true",
+        help="When stitching, insert a no-transition gap equal to index-flux delta per hole.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -306,6 +330,17 @@ def main() -> None:
         "--require-sync",
         action="store_true",
         help="Require an 0xA1 sync byte before IDAM when scanning sectors.",
+    )
+    parser.add_argument(
+        "--score-grid",
+        action="store_true",
+        help="Score FM/MFM candidates across clock scales/polarity and report top marks/entropy.",
+    )
+    parser.add_argument(
+        "--score-window",
+        type=int,
+        default=4096,
+        help="Bytes to consider when scoring grid candidates (default 4096).",
     )
     args = parser.parse_args()
     if args.mark_payload_dir:
@@ -358,12 +393,15 @@ def main() -> None:
     default_tracks = [present_tracks[0]] if present_tracks else []
     tracks = args.tracks or default_tracks
 
+    index_aligned_flag = bool(hdr.flags & 0x01)
+    alignment_note = "index-aligned" if index_aligned_flag else "random-start"
     print(
         f"File: {args.scp_path}\n"
         f" Tracks: {hdr.start_track}-{hdr.end_track} "
         f"({len(present_tracks)} with data, sides={hdr.sides})\n"
         f" Revolutions recorded: {hdr.revolutions}\n"
-        f" Cell width: {hdr.cell_width} (flags=0x{hdr.flags:02x})\n"
+        f" Cell width code: {hdr.cell_width_code} res={hdr.capture_resolution} "
+        f"(flags=0x{hdr.flags:02x}, {alignment_note})\n"
         f" Sample freq: {image.sample_freq_hz} Hz\n"
         f" Non-empty tracks: {', '.join(str(t) for t in present_tracks[:10])}"
         f"{'...' if len(present_tracks) > 10 else ''}"
@@ -381,11 +419,16 @@ def main() -> None:
         if track is None:
             print("\nHard-sector summary skipped: no data on track")
         else:
-            grouping = group_hard_sectors(track, sectors_per_rotation=32)
+            grouping = group_hard_sectors(
+                track,
+                sectors_per_rotation=32,
+                index_aligned=bool(hdr.flags & 0x01),
+            )
             print(
                 f"\nHard-sector summary (track {tracks[0]}): "
                 f"{grouping.rotations} rotations, "
-                f"{grouping.sectors_per_rotation}+{grouping.index_holes_per_rotation} holes each"
+                f"{grouping.sectors_per_rotation}+{grouping.index_holes_per_rotation} holes each "
+                f"(rotated_by={grouping.rotated_by}, index_conf={grouping.index_confidence:.2f})"
             )
             avg_tick = sum(r.index_ticks for r in track.revolutions) / track.revolution_count
             print(f" Avg index ticks per hole: {avg_tick:.1f}")
@@ -395,6 +438,14 @@ def main() -> None:
                     f"  hole {hole.hole_index:02d}: rev {hole.revolution_index} "
                     f"ticks={hole.index_ticks} flux_count={hole.flux_count}"
                 )
+            if args.flux_deltas:
+                deltas = compute_flux_index_deltas(track, max_entries=64)
+                if deltas:
+                    worst = max(deltas, key=abs)
+                    print(
+                        f" Flux-index deltas (index_ticks - sum(flux)) first {len(deltas)}: "
+                        f"min {min(deltas)} max {max(deltas)} worst_abs {worst}"
+                    )
 
     if args.decode_fm and tracks:
         target_track = tracks[0]
@@ -455,10 +506,80 @@ def main() -> None:
             if marks:
                 print(f" Data marks found at offsets: {', '.join(str(m[0]) for m in marks[:20])}")
 
+    if args.score_grid and tracks:
+        track = image.read_track(tracks[0])
+        if track is None:
+            print("\nGrid scoring skipped: no data on track")
+        else:
+            grouping = group_hard_sectors(
+                track,
+                sectors_per_rotation=32,
+                index_aligned=bool(hdr.flags & 0x01),
+            )
+            stitched_flux, stitched_ticks = stitch_rotation_flux(
+                track, grouping, rotation_index=0, compensate_gaps=args.stitch_gap_comp
+            )
+            base_flux = stitched_flux if stitched_flux else track.decode_flux(0)
+            base_ticks = stitched_ticks if stitched_ticks else track.revolutions[0].index_ticks
+            candidates = []
+            mark_set = {0xFE, 0xFB, 0xFA, 0xA1}
+            for encoding in ("fm", "mfm"):
+                for invert_bits in (False, True):
+                    for scale in (0.5, 0.75, 1.0, 1.25, 2.0):
+                        flux = list(base_flux)
+                        if args.invert_flux:
+                            flux = list(reversed(flux))
+                        if scale != 1.0:
+                            flux = [max(1, int(x * scale)) for x in flux]
+                        bitcells = pll_decode_bits(
+                            flux,
+                            sample_freq_hz=image.sample_freq_hz,
+                            index_ticks=base_ticks,
+                            clock_adjust=args.clock_adjust,
+                            initial_clock_ticks=None,
+                            invert=invert_bits,
+                        )
+                        if encoding == "fm":
+                            _, candidate_bytes = fm_bytes_from_bitcells(bitcells)
+                        else:
+                            _, candidate_bytes = mfm_bytes_from_bitcells(bitcells)
+                        window = candidate_bytes[: args.score_window]
+                        mark_count = sum(1 for b in window if b in mark_set)
+                        fill_ratio, entropy = payload_metrics(window)
+                        crc_hits = 0
+                        if encoding == "fm":
+                            crc_hits = sum(1 for g in scan_fm_sectors(candidate_bytes, require_sync=False) if g.crc_ok)
+                        candidates.append(
+                            (
+                                -mark_count,
+                                fill_ratio,
+                                -entropy,
+                                -crc_hits,
+                                encoding,
+                                invert_bits,
+                                scale,
+                                mark_count,
+                                entropy,
+                                crc_hits,
+                            )
+                        )
+            candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
+            print("\nGrid score candidates (top 6):")
+            for entry in candidates[:6]:
+                _, fill_ratio, neg_entropy, _, enc, inv_bits, scale, mark_count, entropy, crc_hits = entry
+                print(
+                    f"  {enc} scale={scale} invert_bits={inv_bits}: "
+                    f"marks={mark_count} crc_hits={crc_hits} fill={fill_ratio:.3f} entropy={entropy:.2f}"
+                )
+
     if args.hard_sector_summary and args.scan_sectors and tracks:
         track = image.read_track(tracks[0])
         if track:
-            grouping = group_hard_sectors(track, sectors_per_rotation=32)
+            grouping = group_hard_sectors(
+                track,
+                sectors_per_rotation=32,
+                index_aligned=bool(hdr.flags & 0x01),
+            )
             rotation = min(args.rotation, grouping.rotations - 1)
             guesses = assemble_rotation(
                 image,
@@ -569,7 +690,11 @@ def main() -> None:
                 track = image.read_track(t)
                 if not track:
                     continue
-                grouping = group_hard_sectors(track, sectors_per_rotation=32)
+                grouping = group_hard_sectors(
+                    track,
+                    sectors_per_rotation=32,
+                    index_aligned=bool(hdr.flags & 0x01),
+                )
                 if not grouping.groups:
                     continue
                 first_rot = grouping.groups[0]
@@ -607,13 +732,19 @@ def main() -> None:
                 track = image.read_track(t)
                 if not track:
                     continue
-                grouping = group_hard_sectors(track, sectors_per_rotation=32)
+                grouping = group_hard_sectors(
+                    track,
+                    sectors_per_rotation=32,
+                    index_aligned=bool(hdr.flags & 0x01),
+                )
                 if not grouping.groups:
                     continue
                 first_rot = grouping.groups[0]
 
                 def decode_bits_for_hole(hole) -> list[int]:
                     flux = track.decode_flux(hole.revolution_index)
+                    if args.invert_flux:
+                        flux = list(reversed(flux))
                     flux_scaled = (
                         [max(1, int(x * args.clock_scale)) for x in flux]
                         if args.clock_scale != 1.0
@@ -714,6 +845,54 @@ def main() -> None:
                             record_payload(f"{t}:{label}:fixed{idx}_off{bit_offset}", window)
                             bit_offset += step_bits
                             idx += 1
+                if args.stitch_rotation:
+                    stitched_flux, stitched_ticks = stitch_rotation_flux(
+                        track,
+                        grouping,
+                        rotation_index=0,
+                        compensate_gaps=args.stitch_gap_comp,
+                    )
+                    if stitched_flux:
+                        if args.invert_flux:
+                            stitched_flux = list(reversed(stitched_flux))
+                        flux_scaled = (
+                            [max(1, int(x * args.clock_scale)) for x in stitched_flux]
+                            if args.clock_scale != 1.0
+                            else stitched_flux
+                        )
+                        stitched_bits = pll_decode_bits(
+                            flux_scaled,
+                            sample_freq_hz=image.sample_freq_hz,
+                            index_ticks=stitched_ticks,
+                            clock_adjust=args.clock_adjust,
+                            initial_clock_ticks=None,
+                            invert=args.invert_bitcells,
+                        )
+                        label = "rotation0_stitched"
+                        if outdir:
+                            fname = outdir / f"track{t:03d}_{label}.bits"
+                            fname.write_bytes(bytes(stitched_bits))
+                        if args.scan_bit_patterns:
+                            hits = scan_bit_patterns(stitched_bits)
+                            if hits:
+                                print(
+                                    f"Track {t} {label}: bit-pattern hits (shift,byte,val): {hits[:10]}"
+                                )
+                        if args.bruteforce_marks:
+                            patterns = (0xFE, 0xFB) if args.strict_marks else (0xFB, 0xFA, 0xA1, 0xFE)
+                            payloads = brute_force_mark_payloads(
+                                stitched_bits, payload_bytes=args.mark_payload_bytes, patterns=patterns
+                            )
+                            if payloads and payload_dir:
+                                for idx, (shift, off, val, payload) in enumerate(payloads[:payload_cap]):
+                                    fname = payload_dir / (
+                                        f"track{t:03d}_{label}_shift{shift}_off{off:05d}_val{val:02x}.bin"
+                                    )
+                                    fname.write_bytes(payload)
+                                    record_payload(f"{t}:{label}:mark_shift{shift}_off{off}", payload)
+                            elif payloads:
+                                for shift, off, val, payload in payloads[:payload_cap]:
+                                    record_payload(f"{t}:{label}:mark_shift{shift}_off{off}", payload)
             if outdir:
                 print(f"\nWrote bitcell dumps to {outdir}")
             if payload_dir:

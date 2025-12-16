@@ -1,9 +1,9 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Keep code in a `src/` package (add it if missing) and reserve `tests/` for automated checks; sample flux artifacts currently live in `tests/ACMS80217` (two reference PNGs and `ACMS80217-HS32.scp`).
-- Prefer small, documented fixtures; if you must add large captures, explain the origin and size in a `README` inside the fixture folder.
-- Place one-off scripts in `scripts/` and name them after their intent (e.g., `scripts/inspect_flux.py`).
+- Keep code in `src/` and tests/fixtures in `tests/`. Flux captures: `tests/ACMS80217` and `tests/ACMS80221` (each has PNG references and a `*-HS32.scp`).
+- Prefer small, documented fixtures; if you must add large captures, explain origin/size in a `README` inside the fixture folder.
+- One-off tooling belongs in `scripts/` and should be named for intent (e.g., `inspect_flux.py`).
 
 ## Build, Test, and Development Commands
 - Use Python 3.11+ with a local venv:  
@@ -21,15 +21,21 @@
 
 ## Testing Guidelines
 - Write `pytest` tests under `tests/` with files named `test_*.py`; group fixtures in `conftest.py` when shared.
-- Cover both bit-level parsing and high-level interpretation; include at least one assertion that exercises the sample flux file.
+- Cover both bit-level parsing and high-level interpretation; include at least one assertion that exercises the sample flux files.
 - Target meaningful coverage (≈80% for new modules) and document any intentionally untested paths (e.g., Greaseweazle hardware hooks).
 - Use markers to separate slow/fixture-heavy tests (e.g., `@pytest.mark.slow`) and keep default runs fast.
 
 ## Commit & Pull Request Guidelines
 - Commit messages should be imperative and scoped (e.g., `Add track decoder`, `Harden sector timing parser`); keep subject lines under 72 chars.
 - In PRs, include: a short summary, linked issues (if any), test commands/output, and before/after notes when parser output changes.
-- Call out new fixtures or large binaries explicitly; avoid committing assets over ~10–20 MB without prior discussion.
+- Call out new fixtures or large binaries explicitly; avoid committing assets over ~10–20 MB without prior discussion (disk images here sit below GitHub’s 50 MB ceiling).
 
 ## Data & Safety Notes
 - Verify any shared flux images are safe to redistribute; strip personal metadata from captures and prefer checksums for integrity notes.
 - When unsure about format details, document assumptions inline and in PRs so future contributors can validate against additional disks.
+
+## Workflow Tips
+- `scripts/inspect_flux.py` is the main entry point. Useful combos:
+  - Quick header + hard-sector summary: `python scripts/inspect_flux.py <scp> --track 0 --hard-sector-summary --flux-deltas`.
+  - Mark sweeps across holes: add `--scan-bit-patterns --bruteforce-marks --merge-hole-pairs --fixed-spacing-scan`.
+  - Whole-rotation experiments: `--stitch-rotation --stitch-gap-comp` plus `--score-grid` to rank FM/MFM hypotheses.

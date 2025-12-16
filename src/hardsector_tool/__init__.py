@@ -32,7 +32,9 @@ from .hardsector import (
     best_sector_map,
     decode_hole,
     FORMAT_PRESETS,
+    compute_flux_index_deltas,
     group_hard_sectors,
+    stitch_rotation_flux,
 )
 from .scp import SCPImage, SCPHeader, TrackData, RevolutionEntry
 
@@ -67,6 +69,8 @@ __all__ = [
     "decode_hole",
     "best_sector_map",
     "FORMAT_PRESETS",
+    "compute_flux_index_deltas",
+    "stitch_rotation_flux",
 ]
 
 __version__ = "0.0.1"

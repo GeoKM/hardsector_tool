@@ -21,6 +21,9 @@ def test_header_matches_fixture(scp_image: SCPImage) -> None:
     assert len(header.non_empty_tracks) == 77
     assert header.track_offsets[0] == 688
     assert header.track_offsets[2] > header.track_offsets[0]
+    assert header.cell_width_code == 0
+    assert header.capture_resolution == 0
+    assert header.heads == 1
 
 
 def test_track_zero_flux_round_trip(scp_image: SCPImage) -> None:

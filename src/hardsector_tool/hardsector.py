@@ -10,7 +10,8 @@ analysis easier.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from statistics import median
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .fm import (
     DEFAULT_CLOCK_ADJ,
@@ -21,7 +22,7 @@ from .fm import (
     pll_decode_fm_bytes,
     scan_fm_sectors,
 )
-from .scp import SCPImage, TrackData
+from .scp import RevolutionEntry, SCPImage, TrackData
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,9 @@ class HardSectorGrouping:
     groups: List[List[HoleCapture]]
     sectors_per_rotation: int
     index_holes_per_rotation: int = 1
+    rotated_by: int = 0
+    index_confidence: float = 0.0
+    index_aligned_flag: Optional[bool] = None
 
     @property
     def rotations(self) -> int:
@@ -50,28 +54,76 @@ FORMAT_PRESETS = {
 }
 
 
-def group_hard_sectors(track: TrackData, sectors_per_rotation: int = 32) -> HardSectorGrouping:
+def _detect_index_hole_offset(
+    revs: Sequence[RevolutionEntry], holes_per_rotation: int
+) -> Tuple[int, float]:
+    """
+    Heuristically locate the index-hole entry within the first rotation.
+    Returns (offset, confidence_ratio).
+    """
+    if not revs:
+        return 0, 0.0
+    window = revs[:holes_per_rotation]
+    ticks = [rev.index_ticks for rev in window]
+    max_idx = max(range(len(ticks)), key=ticks.__getitem__)
+    med = median(ticks) if len(ticks) > 1 else ticks[0] if ticks else 0.0
+    confidence = (ticks[max_idx] / med) if med else 0.0
+    return max_idx, confidence
+
+
+def group_hard_sectors(
+    track: TrackData,
+    sectors_per_rotation: int = 32,
+    index_aligned: bool = True,
+    require_strong_index: bool = False,
+) -> HardSectorGrouping:
     """
     Chunk revolutions into rotations based on the expected hole count.
+
+    If the SCP FLAGS indicate capture did not begin immediately after index
+    (index_aligned=False), we rotate the revolution list so each grouping
+    starts with the entry whose index_ticks stands out as the index hole.
     """
     holes_per_rotation = sectors_per_rotation + 1
-    revs = track.revolutions
+    revs = list(track.revolutions)
+    rotated_by = 0
+    confidence = 0.0
+
+    offset, confidence = _detect_index_hole_offset(revs, holes_per_rotation)
+    should_rotate = (not index_aligned and offset != 0) or (
+        offset != 0 and confidence > 1.2 and not require_strong_index
+    )
+    if should_rotate:
+        rotated_by = offset
+        revs = revs[offset:] + revs[:offset]
+    ordered_indices = list(range(len(track.revolutions)))
+    if should_rotate:
+        ordered_indices = ordered_indices[offset:] + ordered_indices[:offset]
+
     groups: List[List[HoleCapture]] = []
     for base in range(0, len(revs), holes_per_rotation):
         chunk = revs[base : base + holes_per_rotation]
         if len(chunk) < holes_per_rotation:
             break
-        captures = [
-            HoleCapture(
-                hole_index=i,
-                revolution_index=base + i,
-                index_ticks=rev.index_ticks,
-                flux_count=rev.flux_count,
+        captures: List[HoleCapture] = []
+        for i, rev in enumerate(chunk):
+            orig_idx = ordered_indices[base + i]
+            captures.append(
+                HoleCapture(
+                    hole_index=i,
+                    revolution_index=orig_idx,
+                    index_ticks=rev.index_ticks,
+                    flux_count=rev.flux_count,
+                )
             )
-            for i, rev in enumerate(chunk)
-        ]
         groups.append(captures)
-    return HardSectorGrouping(groups=groups, sectors_per_rotation=sectors_per_rotation)
+    return HardSectorGrouping(
+        groups=groups,
+        sectors_per_rotation=sectors_per_rotation,
+        rotated_by=rotated_by,
+        index_confidence=confidence,
+        index_aligned_flag=index_aligned,
+    )
 
 
 def decode_hole(
@@ -112,6 +164,50 @@ def decode_hole(
         decoded.bytes_out, require_sync=require_sync, sync_bytes=sync_bytes
     )
     return sectors[0] if sectors else None
+
+
+def compute_flux_index_deltas(track: TrackData, max_entries: Optional[int] = None) -> List[int]:
+    """
+    Compare recorded index_ticks to the sum of flux intervals for each entry.
+
+    Large deltas can indicate chopped intervals around hard-sector holes or
+    mis-parsed offsets.
+    """
+    deltas: List[int] = []
+    limit = track.revolution_count if max_entries is None else min(max_entries, track.revolution_count)
+    for idx in range(limit):
+        flux = track.decode_flux(idx)
+        delta = track.revolutions[idx].index_ticks - sum(flux)
+        deltas.append(delta)
+    return deltas
+
+
+def stitch_rotation_flux(
+    track: TrackData,
+    grouping: HardSectorGrouping,
+    rotation_index: int,
+    compensate_gaps: bool = False,
+) -> Tuple[List[int], int]:
+    """
+    Concatenate all hole flux intervals for a given rotation into a single list.
+
+    If compensate_gaps is True, insert a no-transition interval equal to the
+    difference between index_ticks and summed flux for each hole.
+    Returns (flux_intervals, approx_index_ticks_for_rotation).
+    """
+    if rotation_index >= grouping.rotations:
+        return [], 0
+    stitched: List[int] = []
+    holes = grouping.groups[rotation_index]
+    total_index_ticks = sum(h.index_ticks for h in holes)
+    for hole in holes:
+        flux = track.decode_flux(hole.revolution_index)
+        stitched.extend(flux)
+        if compensate_gaps:
+            delta = hole.index_ticks - sum(flux)
+            if delta > 0:
+                stitched.append(delta)
+    return stitched, total_index_ticks
 
 
 def decode_hole_bytes(
@@ -232,7 +328,11 @@ def decode_track_best_map(
     track = image.read_track(track_number)
     if not track:
         return {}
-    grouping = group_hard_sectors(track, sectors_per_rotation=sectors_per_rotation)
+    grouping = group_hard_sectors(
+        track,
+        sectors_per_rotation=sectors_per_rotation,
+        index_aligned=bool(image.header.flags & 0x01),
+    )
     all_rotations = [
         assemble_rotation(
             image,

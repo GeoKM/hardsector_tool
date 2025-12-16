@@ -52,8 +52,9 @@ class SCPHeader:
     start_track: int
     end_track: int
     flags: int
-    cell_width: int
-    single_sided: bool
+    cell_width_code: int
+    capture_resolution: int
+    heads: int
     checksum: int
     track_offsets: Tuple[int, ...]
 
@@ -67,7 +68,20 @@ class SCPHeader:
 
     @property
     def sides(self) -> int:
-        return 1 if self.single_sided else 2
+        if self.heads <= 1:
+            return 1
+        return 2
+
+    @property
+    def cell_width(self) -> int:
+        """
+        Compatibility alias for the legacy cell_width field.
+
+        SCP stores a bitcell width selector byte (typically 0 = 16-bit
+        entries) plus a capture resolution byte. We expose the selector
+        here to preserve existing prints.
+        """
+        return self.cell_width_code
 
 
 class SCPImage:
@@ -93,14 +107,13 @@ class SCPImage:
             end_track,
             flags,
             cell0,
-            single_sided_flag,
-            cell1,
+            heads_raw,
+            resolution,
             checksum,
         ) = struct.unpack("<3s9BI", data[0:16])
         if signature != b"SCP":
             raise ValueError("Not an SCP image (missing SCP signature)")
 
-        cell_width = cell0 | (cell1 << 8)
         track_offsets = struct.unpack("<168I", data[16:0x2B0])
 
         hdr = SCPHeader(
@@ -110,8 +123,9 @@ class SCPImage:
             start_track=start_track,
             end_track=end_track,
             flags=flags,
-            cell_width=cell_width,
-            single_sided=bool(single_sided_flag),
+            cell_width_code=cell0,
+            capture_resolution=resolution,
+            heads=heads_raw,
             checksum=checksum,
             track_offsets=tuple(track_offsets),
         )

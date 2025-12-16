@@ -1,15 +1,13 @@
 # Work Plan
 
-Goal: build a usable hard-sector SCP flux decoder and inspection CLI tailored to the ACMS80217 sample (8" SS/DD, hard-sector 32, recorded with Greaseweazle `--hardsector --raw --revs=5`).
+Goal: decode the Wang OIS 8" hard-sector captures (ACMS80217/ACMS80221, 32 holes + index, 5 revs) and build inspection tooling that can surface sector framing or payload structure.
 
-Short-term tasks
-- SCP ingestion: parse the image header (tracks 0–152, single-sided) and 168-entry track offset table; extract per-track revolution metadata and flux blobs.
-- Flux decoding utilities: convert SCP bitcell samples (40 MHz base) into tick durations per revolution; verify sums against the recorded index intervals.
-- CLI: add `scripts/inspect_flux.py` to summarize headers and track stats (track range, revolution count, index timing, flux counts) with an option to decode a limited number of revolutions for speed.
-- Tests: assert header fields match the fixture, track offsets are populated on even indices (77 tracks), and decoded flux for track 0 revolution 0 matches stored counts and index timing within tolerance.
+Progress
+- SCP parser now exposes cell width code and capture resolution; hard-sector grouping honors the FLAGS index-aligned bit and can auto-rotate to the detected index hole.
+- FM/MFM decoding includes PLL-based FM framing, DAM-after-IDAM scanning, merged-hole and fixed-spacing sweeps, stitched-rotation scans, entropy reporting, and flux delta diagnostics.
+- CLI can brute-force mark payloads, score FM/MFM hypotheses across clock scales and polarity, and assemble best-effort sector maps.
 
-Notes and assumptions
-- Track numbers are absolute (`cylinder * sides + side`); in this image only even-numbered tracks are present, consistent with single-sided capture.
-- SCP sample frequency is 40 MHz; flux deltas are stored as big-end 16-bit words with 0 indicating an extra 65,536 ticks (carry logic mirrors Greaseweazle’s SCP code).
-- Keep fixture reads to the minimum needed for tests (one track, first revolution by default) to avoid long runtimes.
-- Future steps: layer FM decoding (expected 16 × 256-byte sectors/track) and format detection on top of the flux parser, then extend the CLI to emit decoded sector maps.
+Next steps (guided by GPT-5.2 and Wang geometry prior: 16×256 FM from 32 hard-sector holes)
+1. Run stitched-rotation sweeps with `--score-grid --stitch-gap-comp` across tracks 0–20 on both disks; capture top mark payloads/entropy outliers for clustering.
+2. Use `--flux-deltas` to verify capture coherence; if stable, rerun mark sweeps with merged holes and gap compensation to catch IDAM/DAM that straddle hole boundaries.
+3. When repeated payloads appear, pin down CHRN/DAM spacing for a Wang-specific parser (16 logical sectors per track) and then extend presets/decoders for CP/M once reference images arrive.
