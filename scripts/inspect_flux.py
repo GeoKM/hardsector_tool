@@ -187,6 +187,11 @@ def main() -> None:
         help="Scan decoded bytes for data marks (0xFB/0xFA) without CRC.",
     )
     parser.add_argument(
+        "--invert-bytes",
+        action="store_true",
+        help="Invert decoded bytes (bitwise NOT) when dumping holes and scanning marks.",
+    )
+    parser.add_argument(
         "--write-sectors",
         type=Path,
         default=None,
@@ -315,7 +320,8 @@ def main() -> None:
                         f"size={g.length} crc_ok={g.crc_ok} id_crc={g.id_crc_ok} data_crc={g.data_crc_ok}"
                     )
         if args.scan_marks:
-            marks = scan_data_marks(result.bytes_out)
+            payload = bytes(~b & 0xFF for b in result.bytes_out) if args.invert_bytes else result.bytes_out
+            marks = scan_data_marks(payload)
             if marks:
                 print(f" Data marks found at offsets: {', '.join(str(m[0]) for m in marks[:20])}")
 
@@ -450,6 +456,8 @@ def main() -> None:
                         initial_clock_ticks=None,
                         clock_adjust=args.clock_adjust,
                     )
+                    if args.invert_bytes:
+                        data = bytes(~b & 0xFF for b in data)
                     fname = outdir / f"track{t:03d}_hole{hole.hole_index:02d}.bin"
                     fname.write_bytes(data)
             print(f"Wrote hole dumps to {outdir}")

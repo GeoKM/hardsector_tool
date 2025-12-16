@@ -33,8 +33,8 @@ Key options:
 
 ## Current Wang OIS sample status
 - SCP header: 198 revolutions per track; 77 even-numbered tracks populated; 32 sector holes + 1 index per rotation.
-- Attempts so far (FM/MFM, strict/loose, synthetic-from-holes, PLL tuning) do not yield valid IDAMs/CRCs; assembled images are all fill bytes. Hole-level decodes mostly read as 0xFF bursts with short payloads.
-- Investigation continues: next probes will sweep multiple tracks, adjust sync/mark heuristics, and extract raw hole payload dumps for manual analysis. A Wang-specific directory/sector parser will follow once sectors are recovered.
+- Attempts so far (FM/MFM, strict/loose, synthetic-from-holes, PLL tuning, mark scans) do not yield valid IDAMs/CRCs; assembled images are all fill bytes. Hole-level decodes are short and mostly uniform (0xFF or 0x00 when inverted).
+- Investigation continues: use `--dump-holes`, `--dump-bitcells`, `--scan-marks`, and `--track-range` to collect evidence across tracks; a Wang-specific framing/directory parser will follow once sectors show structure.
 
 ## Notes for other formats
 - CP/M presets are available (`--preset cpm-16x256` or `--preset cpm-26x128`), but sample media for validation is still needed.
