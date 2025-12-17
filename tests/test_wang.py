@@ -56,3 +56,20 @@ def test_reconstruct_track_sets_window_metadata() -> None:
         assert 0 <= rec.hole_shift < 32
     else:
         assert reconstructed == {}
+
+
+def test_reconstruct_track_supports_unpaired_sectors() -> None:
+    image = SCPImage.from_file(FIXTURE)
+    reconstructed, _, _ = reconstruct_track(
+        image,
+        0,
+        sector_size=256,
+        logical_sectors=32,
+        sectors_per_rotation=32,
+        pair_phase=0,
+        pair_hole_windows=False,
+    )
+    assert reconstructed == {} or (
+        max(s.sector_id for s in reconstructed.values()) < 32
+        and len(reconstructed) <= 32
+    )
