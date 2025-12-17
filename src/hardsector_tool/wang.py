@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Callable, Dict, Sequence, Tuple
+from typing import Dict, Iterable, Sequence
 
 from .fm import FMPhaseCandidate, crc16_ibm, decode_fm_bytes, pll_decode_fm_bytes
 from .hardsector import HoleCapture, group_hard_sectors, pair_holes
@@ -39,6 +40,9 @@ class DecodedStream:
     phase_candidates: dict[int, FMPhaseCandidate]
     invert: bool
     clock_scale: float
+    bitcells: tuple[int, ...] | None
+    clock_ticks: float | None
+    half_cell_ticks: float | None
 
 
 @dataclass
@@ -73,19 +77,176 @@ class SectorReconstruction:
     mean_similarity_kept: float
     phase_consensus: dict[int, bytes]
     chosen_fm_phase: int
+    best_transform: "TransformResult | None"
+    transform_results: list["TransformResult"]
+    phase_window_stats: dict[int, tuple[float, float]]
+    phase_warning: str | None
 
 
-ChecksumFunc = Tuple[str, Callable[[bytes], int]]
+@dataclass(frozen=True)
+class ChecksumHit:
+    algorithm: str
+    stored_endian: str
+    reflected: bool
+    position: str
+    value: int
 
 
-CHECKSUM_CANDIDATES: tuple[ChecksumFunc, ...] = (
-    ("sum16-be", lambda data: sum(data) & 0xFFFF),
-    ("sum16-le", lambda data: int.from_bytes(sum(data).to_bytes(2, "little"), "big")),
-    ("ones-complement", lambda data: (~sum(data)) & 0xFFFF),
-    ("xor16", lambda data: bytes_to_int_xor(data)),
-    ("crc16-ibm", lambda data: crc16_ibm(data)),
-    ("crc16-ccitt", lambda data: crc16_ccitt(data)),
-)
+@dataclass(frozen=True)
+class TransformResult:
+    phase: int
+    invert: bool
+    bit_reverse: bool
+    payload: bytes
+    entropy: float
+    fill_ratio: float
+    preview_head: str
+    preview_tail: str
+    checksum_hits: tuple[ChecksumHit, ...]
+
+
+def bit_reverse_byte(value: int) -> int:
+    out = 0
+    for i in range(8):
+        out = (out << 1) | ((value >> i) & 0x01)
+    return out
+
+
+def bit_reverse_bytes(data: bytes) -> bytes:
+    return bytes(bit_reverse_byte(b) for b in data)
+
+
+def run_length_histogram(bitcells: Iterable[int], limit: int = 16) -> dict[str, int]:
+    hist: Counter[int] = Counter()
+    prev: int | None = None
+    run = 0
+    for bit in bitcells:
+        if bit == prev:
+            run += 1
+        else:
+            if prev is not None:
+                hist[min(run, limit)] += 1
+            prev = bit
+            run = 1
+    if prev is not None:
+        hist[min(run, limit)] += 1
+    return {str(k): v for k, v in sorted(hist.items())}
+
+
+def _byte_entropy(values: bytes) -> float:
+    if not values:
+        return 0.0
+    counts = Counter(values)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / len(values)
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _byte_fill_ratio(values: bytes) -> float:
+    if not values:
+        return 1.0
+    counts = Counter(values)
+    zero_ff = counts.get(0x00, 0) + counts.get(0xFF, 0)
+    top = max(counts.values())
+    return max(zero_ff, top) / len(values)
+
+
+def _top_frequencies(values: bytes, limit: int = 6) -> list[tuple[str, int]]:
+    counts = Counter(values)
+    return [(f"{val:02x}", count) for val, count in counts.most_common(limit)]
+
+
+def _preview_hex(values: bytes, span: int = 32) -> tuple[str, str]:
+    head = values[:span]
+    tail = values[-span:] if len(values) > span else b""
+    return head.hex(), tail.hex()
+
+
+def _crc16_non_reflected(data: bytes, poly: int, initial: int, xorout: int = 0) -> int:
+    crc = initial
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ poly) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc ^ xorout
+
+
+def _crc16_reflected(data: bytes, poly: int, initial: int, xorout: int = 0) -> int:
+    crc = initial
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        crc &= 0xFFFF
+    return crc ^ xorout
+
+
+def sweep_16bit_checks(payload: bytes) -> list[ChecksumHit]:
+    if len(payload) < 2:
+        return []
+    body = payload[:-2]
+    stored = payload[-2:]
+    stored_last1 = payload[-1]
+    stored_fields = [
+        ("last2", "big", int.from_bytes(stored, "big")),
+        ("last2-swapped", "little", int.from_bytes(stored, "little")),
+    ]
+    algorithms: list[tuple[str, int, bool]] = [
+        ("crc16-ccitt-false", _crc16_non_reflected(body, 0x1021, 0xFFFF), False),
+        ("crc16-xmodem", _crc16_non_reflected(body, 0x1021, 0x0000), False),
+        ("crc16-ibm-arc", _crc16_reflected(body, 0xA001, 0x0000), True),
+        ("crc16-x25", _crc16_reflected(body, 0x8408, 0xFFFF, 0xFFFF), True),
+        ("crc16-ccitt-ibm", crc16_ibm(body), False),
+        ("sum16", sum(body) & 0xFFFF, False),
+        ("sum16-ones-complement", (~sum(body)) & 0xFFFF, False),
+        ("xor16", bytes_to_int_xor(body), False),
+    ]
+    hits: list[ChecksumHit] = []
+    for position, endian, stored_value in stored_fields:
+        for name, computed, reflected in algorithms:
+            if computed == stored_value:
+                hits.append(
+                    ChecksumHit(
+                        algorithm=name,
+                        stored_endian=endian,
+                        reflected=reflected,
+                        position=position,
+                        value=computed,
+                    )
+                )
+    lrc8 = ((-sum(body)) & 0xFF) if body else 0
+    if lrc8 == stored_last1:
+        hits.append(
+            ChecksumHit(
+                algorithm="lrc8",
+                stored_endian="byte",
+                reflected=False,
+                position="last1",
+                value=lrc8,
+            )
+        )
+    xor8 = 0
+    for b in body:
+        xor8 ^= b
+    if xor8 == stored_last1:
+        hits.append(
+            ChecksumHit(
+                algorithm="xor8",
+                stored_endian="byte",
+                reflected=False,
+                position="last1",
+                value=xor8,
+            )
+        )
+    return hits
 
 
 def bytes_to_int_xor(data: bytes) -> int:
@@ -110,15 +271,9 @@ def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
 def checksum_hits(body: bytes, expected: bytes) -> tuple[str, ...]:
     if len(expected) != 2:
         return ()
-    exp_val = int.from_bytes(expected, "big")
-    hits: list[str] = []
-    for name, func in CHECKSUM_CANDIDATES:
-        try:
-            if func(body) == exp_val:
-                hits.append(name)
-        except Exception:
-            continue
-    return tuple(hits)
+    payload = body + expected
+    hits = sweep_16bit_checks(payload)
+    return tuple({hit.algorithm for hit in hits})
 
 
 def _window_entropy(data: bytes) -> float:
@@ -139,6 +294,30 @@ def _fill_ratio_ff00(data: bytes) -> float:
     zero_ff = counts.get(0x00, 0) + counts.get(0xFF, 0)
     top = max(counts.values())
     return max(zero_ff, top) / len(data)
+
+
+def _phase_ones_ratio_near_offset(
+    stream: DecodedStream,
+    candidate: FMPhaseCandidate,
+    byte_offset: int,
+    window_bytes: int = 64,
+) -> tuple[float, float] | None:
+    if stream.bitcells is None or byte_offset < 0:
+        return None
+    data_bit_index = candidate.data_bit_offset + byte_offset * 8
+    if data_bit_index < 0:
+        return None
+    total_bits = max(1, window_bytes * 8)
+    start_data = candidate.phase + 2 * data_bit_index
+    end_data = start_data + total_bits * 2
+    if start_data >= len(stream.bitcells):
+        return None
+    data_slice = stream.bitcells[start_data:end_data:2]
+    clock_start = (candidate.phase ^ 1) + 2 * data_bit_index
+    clock_slice = stream.bitcells[clock_start : clock_start + total_bits * 2 : 2]
+    if not data_slice or not clock_slice:
+        return None
+    return (sum(data_slice) / len(data_slice), sum(clock_slice) / len(clock_slice))
 
 
 def similarity(a: bytes, b: bytes) -> float:
@@ -245,10 +424,15 @@ def _decode_capture(
                 result.fm_phase: FMPhaseCandidate(
                     phase=result.fm_phase,
                     bit_shift=result.bit_shift,
+                    data_bit_offset=0,
                     bytes_out=result.bytes_out,
                     entropy=entropy,
                     fill_ratio=fill,
+                    data_ones_ratio=fill,
+                    clock_ones_ratio=fill,
                     score=entropy - fill * 2.0,
+                    window_bits=len(sample) * 8,
+                    window_start_bit=0,
                     sample_size=len(sample),
                 )
             }
@@ -258,6 +442,9 @@ def _decode_capture(
             phase_candidates=candidate_map,
             invert=invert,
             clock_scale=clock_scale,
+            bitcells=result.bitcells,
+            clock_ticks=result.clock_ticks,
+            half_cell_ticks=result.half_cell_ticks,
         )
 
     decoded = decode_fm_bytes(flux)
@@ -267,10 +454,15 @@ def _decode_capture(
     fallback = FMPhaseCandidate(
         phase=0,
         bit_shift=decoded.bit_shift,
+        data_bit_offset=0,
         bytes_out=decoded.bytes_out,
         entropy=entropy,
         fill_ratio=fill_ratio,
+        data_ones_ratio=fill_ratio,
+        clock_ones_ratio=fill_ratio,
         score=entropy - fill_ratio * 2.0,
+        window_bits=len(sample) * 8,
+        window_start_bit=0,
         sample_size=len(sample),
     )
     return DecodedStream(
@@ -279,6 +471,9 @@ def _decode_capture(
         phase_candidates={0: fallback},
         invert=invert,
         clock_scale=clock_scale,
+        bitcells=None,
+        clock_ticks=None,
+        half_cell_ticks=None,
     )
 
 
@@ -477,6 +672,33 @@ def _reconstruct_sector(
         payload_entropy = _window_entropy(payload)
         payload_fill = _fill_ratio_ff00(payload)
 
+    phase_window_scores: dict[int, list[tuple[float, float]]] = {}
+    phase_warning: str | None = None
+    for idx in kept:
+        stream = streams[idx]
+        rel_offset = payload_offset - shifts[idx]
+        for phase, candidate in stream.phase_candidates.items():
+            ratios = _phase_ones_ratio_near_offset(
+                stream, candidate, rel_offset, window_bytes=64
+            )
+            if ratios is None:
+                continue
+            data_ratio, clock_ratio = ratios
+            phase_window_scores.setdefault(phase, []).append((data_ratio, clock_ratio))
+            if data_ratio > 0.95 and clock_ratio > 0.95:
+                phase_warning = (
+                    "WARNING: likely still in gap/preamble; need better offset"
+                )
+
+    phase_window_stats = {
+        phase: (
+            statistics.mean(v[0] for v in ratios),
+            statistics.mean(v[1] for v in ratios),
+        )
+        for phase, ratios in phase_window_scores.items()
+        if ratios
+    }
+
     rotation_similarity = [
         RotationSimilarity(
             rotation_index=stat.rotation_index,
@@ -494,6 +716,66 @@ def _reconstruct_sector(
         if kept
         else 0
     )
+    if phase_window_stats:
+        chosen_phase = max(
+            phase_window_stats.items(),
+            key=lambda item: (item[1][1] - item[1][0], item[1][1]),
+        )[0]
+
+    phase_payloads: dict[int, bytes] = {}
+    for phase, stream_bytes in phase_consensus.items():
+        segment = stream_bytes[payload_offset : payload_offset + sector_size]
+        if len(segment) < sector_size:
+            segment = segment.ljust(sector_size, b"\x00")
+        phase_payloads[phase] = segment
+    if chosen_phase in phase_payloads:
+        payload = phase_payloads[chosen_phase]
+        payload_entropy = _window_entropy(payload)
+        payload_fill = _fill_ratio_ff00(payload)
+
+    transform_results: list[TransformResult] = []
+    for phase, segment in phase_payloads.items():
+        for inv in (False, True):
+            for br in (False, True):
+                transformed = segment
+                if inv:
+                    transformed = bytes(~b & 0xFF for b in transformed)
+                if br:
+                    transformed = bit_reverse_bytes(transformed)
+                head, tail = _preview_hex(transformed)
+                transform_results.append(
+                    TransformResult(
+                        phase=phase,
+                        invert=inv,
+                        bit_reverse=br,
+                        payload=transformed,
+                        entropy=_window_entropy(transformed),
+                        fill_ratio=_fill_ratio_ff00(transformed),
+                        preview_head=head,
+                        preview_tail=tail,
+                        checksum_hits=tuple(sweep_16bit_checks(transformed)),
+                    )
+                )
+
+    def _transform_score(result: TransformResult) -> tuple[float, float, float]:
+        return (
+            float(len(result.checksum_hits)),
+            -result.fill_ratio,
+            result.entropy,
+        )
+
+    best_transform = (
+        max(transform_results, key=_transform_score) if transform_results else None
+    )
+    checksum_algorithms: tuple[str, ...] = ()
+    if best_transform and best_transform.checksum_hits:
+        checksum_algorithms = tuple(
+            {
+                f"p{best_transform.phase}_inv{int(best_transform.invert)}_br"
+                f"{int(best_transform.bit_reverse)}:{hit.algorithm}"
+                for hit in best_transform.checksum_hits
+            }
+        )
 
     sector = WangSector(
         track=track_number,
@@ -501,7 +783,7 @@ def _reconstruct_sector(
         offset=payload_offset,
         payload=payload,
         checksum=b"",
-        checksum_algorithms=(),
+        checksum_algorithms=checksum_algorithms,
     )
     reconstruction = SectorReconstruction(
         sector_id=sector_id,
@@ -526,6 +808,10 @@ def _reconstruct_sector(
         ),
         phase_consensus=phase_consensus,
         chosen_fm_phase=chosen_phase,
+        best_transform=best_transform,
+        transform_results=transform_results,
+        phase_window_stats=phase_window_stats,
+        phase_warning=phase_warning,
     )
     return reconstruction.wang_sector, reconstruction
 
@@ -680,17 +966,22 @@ def reconstruct_track(
     for stream in all_streams:
         for phase, candidate in stream.phase_candidates.items():
             phase_buckets.setdefault(phase, []).append(candidate)
-    phase_stats = {
-        phase: (
-            sum(c.entropy for c in candidates) / len(candidates) if candidates else 0.0,
-            (
-                sum(c.fill_ratio for c in candidates) / len(candidates)
-                if candidates
-                else 1.0
-            ),
-        )
-        for phase, candidates in phase_buckets.items()
-    }
+    phase_stats = {}
+    for phase, candidates in phase_buckets.items():
+        if not candidates:
+            phase_stats[phase] = {
+                "entropy": 0.0,
+                "fill": 1.0,
+                "data_ones": 1.0,
+                "clock_ones": 1.0,
+            }
+            continue
+        phase_stats[phase] = {
+            "entropy": sum(c.entropy for c in candidates) / len(candidates),
+            "fill": sum(c.fill_ratio for c in candidates) / len(candidates),
+            "data_ones": sum(c.data_ones_ratio for c in candidates) / len(candidates),
+            "clock_ones": sum(c.clock_ones_ratio for c in candidates) / len(candidates),
+        }
     median_length = int(
         median(len(stream.bytes_out) for stream in all_streams) if all_streams else 0
     )
@@ -699,23 +990,116 @@ def reconstruct_track(
         if all_streams
         else 0
     )
+
+    def fmt_phase_stats(phase: int) -> str:
+        stats = phase_stats.get(
+            phase,
+            {"entropy": 0.0, "fill": 1.0, "data_ones": 1.0, "clock_ones": 1.0},
+        )
+        return (
+            f"entropy={stats['entropy']:.2f},"
+            f" fill={stats['fill']:.3f},"
+            f" data_ones={stats['data_ones']:.3f},"
+            f" clock_ones={stats['clock_ones']:.3f}"
+        )
+
     print(
         "  FM phase selection: "
         f"chosen={chosen_phase} "
-        f"phase0(entropy={phase_stats.get(0, (0.0, 1.0))[0]:.2f},"
-        f" fill={phase_stats.get(0, (0.0, 1.0))[1]:.3f}) "
-        f"phase1(entropy={phase_stats.get(1, (0.0, 1.0))[0]:.2f},"
-        f" fill={phase_stats.get(1, (0.0, 1.0))[1]:.3f}) "
+        f"phase0({fmt_phase_stats(0)}) "
+        f"phase1({fmt_phase_stats(1)}) "
         f"decoded_len_med={median_length}"
     )
     print(
         f"  Selected sector_size={best_size} hole_shift={best_shift} "
         f"score={best_score:.2f} sectors={best_len}"
     )
+    sample_bytes = b"".join(
+        stream.phase_candidates.get(chosen_phase, stream).bytes_out[:512]
+        for stream in all_streams
+    )
+    decoded_fill = _fill_ratio_ff00(sample_bytes)
+    decoded_entropy = _window_entropy(sample_bytes)
+    data_phase_ones = phase_stats.get(chosen_phase, {}).get("data_ones", 1.0)
+    clock_phase_ones = phase_stats.get(chosen_phase, {}).get("clock_ones", 1.0)
+    print(
+        "  Decoded bytes stats: "
+        f"fill00ff={decoded_fill:.3f} entropy={decoded_entropy:.2f} "
+        f"ones_ratio_data_phase={data_phase_ones:.3f} "
+        f"ones_ratio_clock_phase={clock_phase_ones:.3f}"
+    )
+    if decoded_fill > 0.85 and decoded_entropy < 1.0:
+        print(
+            "   WARNING: decoded bytes look like gap/clock (mostly FF/00); "
+            "likely wrong phase or wrong window offset"
+        )
 
     if dump_raw:
+        prefix = dump_raw
+        if dump_raw.is_dir():
+            prefix = dump_raw / f"track{track_number:03d}"
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        reference_sector = min(best_recon) if best_recon else None
+        dump_stream: DecodedStream | None = None
+        if reference_sector is not None and best_streams:
+            sector_streams = best_streams.get(reference_sector, [])
+            ref_rotation = best_recon[reference_sector].reference_rotation
+            if 0 <= ref_rotation < len(sector_streams):
+                dump_stream = sector_streams[ref_rotation]
+        if dump_stream and dump_stream.bitcells:
+            bitcells = dump_stream.bitcells
+            phase0 = bitcells[0::2]
+            phase1 = bitcells[1::2]
+            Path(f"{prefix}_phase0_bitcells.bin").write_bytes(bytes(phase0))
+            Path(f"{prefix}_phase1_bitcells.bin").write_bytes(bytes(phase1))
+            stats = {
+                "ones_ratio_phase0": sum(phase0) / len(phase0) if phase0 else 0.0,
+                "ones_ratio_phase1": sum(phase1) / len(phase1) if phase1 else 0.0,
+                "runlen_histogram": run_length_histogram(bitcells),
+                "estimated_halfcell_us": (
+                    (dump_stream.half_cell_ticks / image.sample_freq_hz) * 1_000_000
+                    if dump_stream.half_cell_ticks
+                    else None
+                ),
+                "clock_scale": clock_scale,
+                "bitcell_count": len(bitcells),
+            }
+            Path(f"{prefix}_phase_stats.json").write_text(json.dumps(stats, indent=2))
+            for phase in (0, 1):
+                candidate = dump_stream.phase_candidates.get(phase)
+                if not candidate:
+                    continue
+                base_bytes = candidate.bytes_out
+                Path(f"{prefix}_phase{phase}_data_bytes.bin").write_bytes(base_bytes)
+                for inv in (0, 1):
+                    for br in (0, 1):
+                        transformed = base_bytes
+                        if inv:
+                            transformed = bytes(~b & 0xFF for b in transformed)
+                        if br:
+                            transformed = bit_reverse_bytes(transformed)
+                        Path(
+                            f"{prefix}_p{phase}_inv{inv}_br{br}_data_bytes.bin"
+                        ).write_bytes(transformed)
+                        head, tail = _preview_hex(transformed)
+                        Path(
+                            f"{prefix}_p{phase}_inv{inv}_br{br}_stats.json"
+                        ).write_text(
+                            json.dumps(
+                                {
+                                    "length": len(transformed),
+                                    "entropy": _byte_entropy(transformed),
+                                    "fill_ratio_00ff": _byte_fill_ratio(transformed),
+                                    "top_frequencies": _top_frequencies(transformed),
+                                    "preview_head": head,
+                                    "preview_tail": tail,
+                                },
+                                indent=2,
+                            )
+                        )
+        dump_dir = dump_raw if dump_raw.is_dir() else dump_raw.parent
         for sid, reconstruction in best_recon.items():
-            base = dump_raw / f"track{track_number:03d}_sector{sid:02d}"
+            base = dump_dir / f"track{track_number:03d}_sector{sid:02d}"
             base.parent.mkdir(parents=True, exist_ok=True)
             (base.parent / f"{base.name}_consensus.bin").write_bytes(
                 reconstruction.consensus
@@ -746,6 +1130,21 @@ def reconstruct_track(
                 "payload_entropy": reconstruction.payload_entropy,
                 "payload_fill_ratio": reconstruction.payload_fill_ratio,
                 "stream_length": reconstruction.stream_length,
+                "phase_window_stats": reconstruction.phase_window_stats,
+                "phase_warning": reconstruction.phase_warning,
+                "best_transform": (
+                    {
+                        "phase": reconstruction.best_transform.phase,
+                        "invert": reconstruction.best_transform.invert,
+                        "bit_reverse": reconstruction.best_transform.bit_reverse,
+                        "hits": [
+                            hit.algorithm
+                            for hit in reconstruction.best_transform.checksum_hits
+                        ],
+                    }
+                    if reconstruction.best_transform
+                    else None
+                ),
             }
             (base.parent / f"{base.name}_meta.json").write_text(
                 json.dumps(meta, indent=2)

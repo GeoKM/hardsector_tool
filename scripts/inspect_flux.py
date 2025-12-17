@@ -9,6 +9,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 from statistics import mean, median
 from typing import Iterable
@@ -1194,6 +1195,7 @@ def main() -> None:
                 summary = summarize_wang_map(best_map or {})
                 print(f"\n Track {t} (phase {best_phase}): {summary}")
                 if best_recon:
+                    transform_counter: Counter[str] = Counter()
                     for sid in sorted(best_recon):
                         rec = best_recon[sid]
                         dropped = ",".join(str(i) for i in rec.dropped_rotations)
@@ -1216,6 +1218,36 @@ def main() -> None:
                         )
                         if rot_stats:
                             print(f"    rotation similarity: {rot_stats}")
+                        if rec.best_transform:
+                            transform_label = (
+                                f"p{rec.best_transform.phase}_inv"
+                                f"{int(rec.best_transform.invert)}_br"
+                                f"{int(rec.best_transform.bit_reverse)}"
+                            )
+                            if rec.best_transform.checksum_hits:
+                                hit_names = ", ".join(
+                                    hit.algorithm
+                                    for hit in rec.best_transform.checksum_hits
+                                )
+                                print(
+                                    f"    checksum sweep: {transform_label} => {hit_names}"
+                                )
+                                for hit in rec.best_transform.checksum_hits:
+                                    transform_counter[
+                                        f"{transform_label}:{hit.algorithm}"
+                                    ] += 1
+                            else:
+                                print(
+                                    f"    checksum sweep: {transform_label} (no hits)"
+                                )
+                        if rec.phase_warning:
+                            print(f"    {rec.phase_warning}")
+                    if transform_counter:
+                        tally = ", ".join(
+                            f"{label} x{count}"
+                            for label, count in transform_counter.most_common()
+                        )
+                        print(f"  Checksum hit tally: {tally}")
                     header_hits = detect_header_candidates(
                         best_recon, args.logical_sectors, t
                     )

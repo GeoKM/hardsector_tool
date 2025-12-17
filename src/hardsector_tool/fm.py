@@ -18,6 +18,7 @@ DEFAULT_CLOCK_ADJ = 0.10
 PLL_PERIOD_ADJ = 0.05
 PLL_PHASE_ADJ = 0.60
 FM_PHASE_SAMPLE_BYTES = 1024
+FM_PHASE_WINDOW_BITS = 1024
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,8 @@ class PLLDecodeResult:
     bit_shift: int
     initial_clock_ticks: float
     clock_ticks: float
+    bitcells: tuple[int, ...]
+    half_cell_ticks: float
     fm_phase: int = 0
     phase_candidates: tuple["FMPhaseCandidate", ...] | None = None
     method: str = "pll"
@@ -66,10 +69,15 @@ class SectorGuess:
 class FMPhaseCandidate:
     phase: int
     bit_shift: int
+    data_bit_offset: int
     bytes_out: bytes
     entropy: float
     fill_ratio: float
+    data_ones_ratio: float
+    clock_ones_ratio: float
     score: float
+    window_bits: int
+    window_start_bit: int
     sample_size: int
 
 
@@ -317,6 +325,40 @@ def _fill_ratio_zero_ff(values: bytes) -> float:
     return max(zero_ff, top) / len(values)
 
 
+def _select_phase_window(
+    bitcells: Sequence[int], phase: int, window_bits: int = FM_PHASE_WINDOW_BITS
+) -> tuple[int, float, float, int]:
+    data_bits = bitcells[phase::2]
+    clock_bits = bitcells[(phase ^ 1) :: 2]
+    if not data_bits or not clock_bits:
+        return 0, 1.0, 1.0, 0
+
+    window_bits = min(window_bits, len(data_bits), len(clock_bits))
+    step = max(1, window_bits // 4)
+    best_start = 0
+    best_score = -math.inf
+    best_data_ratio = 1.0
+    best_clock_ratio = 1.0
+    for start in range(0, max(1, len(data_bits) - window_bits + 1), step):
+        window_data = data_bits[start : start + window_bits]
+        window_clock = clock_bits[start : start + window_bits]
+        if not window_data or not window_clock:
+            continue
+        data_ratio = sum(window_data) / len(window_data)
+        clock_ratio = sum(window_clock) / len(window_clock)
+        score = clock_ratio - data_ratio
+        if score > best_score:
+            best_score = score
+            best_start = start
+            best_data_ratio = data_ratio
+            best_clock_ratio = clock_ratio
+    if best_score == -math.inf:
+        best_score = (sum(clock_bits) / len(clock_bits)) - (
+            sum(data_bits) / len(data_bits)
+        )
+    return best_start, best_data_ratio, best_clock_ratio, window_bits
+
+
 def _score_fm_phase(bitcells: Sequence[int], phase: int) -> FMPhaseCandidate:
     data_bits = bitcells[phase::2]
     shift, aligned = best_aligned_bytes(data_bits)
@@ -324,15 +366,23 @@ def _score_fm_phase(bitcells: Sequence[int], phase: int) -> FMPhaseCandidate:
     entropy = _entropy(sample)
     sample_len = len(sample)
     fill_ratio = _fill_ratio_zero_ff(sample)
-    score = entropy - (fill_ratio * 2.0)
+    window_start, data_ratio, clock_ratio, window_bits = _select_phase_window(
+        bitcells, phase
+    )
+    score = entropy - (fill_ratio * 2.0) + (clock_ratio - data_ratio)
     overall_shift = (phase + shift) % 8
     return FMPhaseCandidate(
         phase=phase,
         bit_shift=overall_shift,
+        data_bit_offset=shift,
         bytes_out=aligned,
         entropy=entropy,
         fill_ratio=fill_ratio,
+        data_ones_ratio=data_ratio,
+        clock_ones_ratio=clock_ratio,
         score=score,
+        window_bits=window_bits,
+        window_start_bit=window_start,
         sample_size=sample_len,
     )
 
@@ -341,7 +391,20 @@ def _select_fm_phase_candidates(
     bitcells: Sequence[int],
 ) -> tuple[FMPhaseCandidate, tuple[FMPhaseCandidate, ...]]:
     if not bitcells:
-        empty = FMPhaseCandidate(0, 0, b"", 0.0, 1.0, -math.inf, 0)
+        empty = FMPhaseCandidate(
+            phase=0,
+            bit_shift=0,
+            data_bit_offset=0,
+            bytes_out=b"",
+            entropy=0.0,
+            fill_ratio=1.0,
+            data_ones_ratio=1.0,
+            clock_ones_ratio=1.0,
+            score=-math.inf,
+            window_bits=0,
+            window_start_bit=0,
+            sample_size=0,
+        )
         return empty, (empty,)
 
     candidates: list[FMPhaseCandidate] = []
@@ -351,7 +414,20 @@ def _select_fm_phase_candidates(
         candidates.append(_score_fm_phase(bitcells, phase))
 
     if not candidates:
-        empty = FMPhaseCandidate(0, 0, b"", 0.0, 1.0, -math.inf, 0)
+        empty = FMPhaseCandidate(
+            phase=0,
+            bit_shift=0,
+            data_bit_offset=0,
+            bytes_out=b"",
+            entropy=0.0,
+            fill_ratio=1.0,
+            data_ones_ratio=1.0,
+            clock_ones_ratio=1.0,
+            score=-math.inf,
+            window_bits=0,
+            window_start_bit=0,
+            sample_size=0,
+        )
         return empty, (empty,)
 
     best = max(candidates, key=lambda cand: cand.score)
@@ -491,6 +567,8 @@ def pll_decode_fm_bytes(
         bit_shift=best_phase.bit_shift,
         initial_clock_ticks=clock_ticks,
         clock_ticks=clock_ticks,
+        bitcells=tuple(bitcells),
+        half_cell_ticks=half_med,
         fm_phase=best_phase.phase,
         phase_candidates=candidates,
     )
