@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Sequence
 
 from .fm import FMPhaseCandidate, crc16_ibm, decode_fm_bytes, pll_decode_fm_bytes
 from .hardsector import HoleCapture, group_hard_sectors, pair_holes
