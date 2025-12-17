@@ -52,6 +52,22 @@ def test_pll_decode_and_sector_scan() -> None:
     assert isinstance(guesses, list)
 
 
+def test_pll_decode_tracks_phase_candidates() -> None:
+    scp = SCPImage.from_file(FIXTURE)
+    track = scp.read_track(0)
+    assert track is not None
+    flux = track.decode_flux(0)
+
+    pll_result = pll_decode_fm_bytes(
+        flux,
+        sample_freq_hz=scp.sample_freq_hz,
+        index_ticks=track.revolutions[0].index_ticks,
+    )
+    assert pll_result.phase_candidates
+    phases = {cand.phase for cand in pll_result.phase_candidates or ()}
+    assert pll_result.fm_phase in phases
+
+
 def test_fm_bytes_from_bitcells_chooses_phase() -> None:
     # FM pattern with alternating clock=1, data=0 bits (phase 0 clocks)
     bitcells = [1, 0] * 8

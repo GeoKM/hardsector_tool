@@ -17,6 +17,7 @@ from typing import List, Optional, Sequence, Tuple
 DEFAULT_CLOCK_ADJ = 0.10
 PLL_PERIOD_ADJ = 0.05
 PLL_PHASE_ADJ = 0.60
+FM_PHASE_SAMPLE_BYTES = 1024
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,8 @@ class PLLDecodeResult:
     bit_shift: int
     initial_clock_ticks: float
     clock_ticks: float
+    fm_phase: int = 0
+    phase_candidates: tuple["FMPhaseCandidate", ...] | None = None
     method: str = "pll"
 
 
@@ -57,6 +60,17 @@ class SectorGuess:
     id_crc_ok: bool
     data_crc_ok: bool
     data: Optional[bytes] = None
+
+
+@dataclass(frozen=True)
+class FMPhaseCandidate:
+    phase: int
+    bit_shift: int
+    bytes_out: bytes
+    entropy: float
+    fill_ratio: float
+    score: float
+    sample_size: int
 
 
 def scan_data_marks(
@@ -292,6 +306,58 @@ def _entropy(values: bytes) -> float:
     return entropy
 
 
+def _fill_ratio_zero_ff(values: bytes) -> float:
+    if not values:
+        return 1.0
+    counts = [0] * 256
+    for b in values:
+        counts[b] += 1
+    zero_ff = counts[0x00] + counts[0xFF]
+    top = max(counts)
+    return max(zero_ff, top) / len(values)
+
+
+def _score_fm_phase(bitcells: Sequence[int], phase: int) -> FMPhaseCandidate:
+    data_bits = bitcells[phase::2]
+    shift, aligned = best_aligned_bytes(data_bits)
+    sample = aligned[:FM_PHASE_SAMPLE_BYTES]
+    entropy = _entropy(sample)
+    sample_len = len(sample)
+    fill_ratio = _fill_ratio_zero_ff(sample)
+    score = entropy - (fill_ratio * 2.0)
+    overall_shift = (phase + shift) % 8
+    return FMPhaseCandidate(
+        phase=phase,
+        bit_shift=overall_shift,
+        bytes_out=aligned,
+        entropy=entropy,
+        fill_ratio=fill_ratio,
+        score=score,
+        sample_size=sample_len,
+    )
+
+
+def _select_fm_phase_candidates(
+    bitcells: Sequence[int],
+) -> tuple[FMPhaseCandidate, tuple[FMPhaseCandidate, ...]]:
+    if not bitcells:
+        empty = FMPhaseCandidate(0, 0, b"", 0.0, 1.0, -math.inf, 0)
+        return empty, (empty,)
+
+    candidates: list[FMPhaseCandidate] = []
+    for phase in (0, 1):
+        if phase >= len(bitcells):
+            continue
+        candidates.append(_score_fm_phase(bitcells, phase))
+
+    if not candidates:
+        empty = FMPhaseCandidate(0, 0, b"", 0.0, 1.0, -math.inf, 0)
+        return empty, (empty,)
+
+    best = max(candidates, key=lambda cand: cand.score)
+    return best, tuple(candidates)
+
+
 def best_aligned_bytes(bits: Sequence[int]) -> Tuple[int, bytes]:
     """
     Try all bit shifts (0-7) and pick the byte stream with the most stable content.
@@ -416,14 +482,17 @@ def pll_decode_fm_bytes(
         clock_adjust=clock_adjust,
         invert=invert,
     )
-    shift, decoded = fm_bytes_from_bitcells(bitcells)
+    best_phase, candidates = _select_fm_phase_candidates(bitcells)
+    decoded = best_phase.bytes_out
     half_med, _, _ = estimate_cell_ticks(flux)
     clock_ticks = initial_clock_ticks if initial_clock_ticks else half_med * 2
     return PLLDecodeResult(
         bytes_out=decoded,
-        bit_shift=shift,
+        bit_shift=best_phase.bit_shift,
         initial_clock_ticks=clock_ticks,
         clock_ticks=clock_ticks,
+        fm_phase=best_phase.phase,
+        phase_candidates=candidates,
     )
 
 
@@ -431,31 +500,13 @@ def fm_bytes_from_bitcells(bitcells: Sequence[int]) -> Tuple[int, bytes]:
     """
     Convert PLL bitcells into FM data bytes.
 
-    We try both clock/data phases, pick the clock phase with the densest
-    transitions, then align the resulting data-bit stream into bytes.
+    We try both half-cell phases (even/odd bitcells as data), score them by
+    entropy minus fill ratio, and then align the chosen data-bit stream into
+    bytes.
     """
 
-    if not bitcells:
-        return 0, b""
-
-    best_phase = 0
-    best_score = -math.inf
-    chosen_bits: Sequence[int] = ()
-
-    for phase in (0, 1):
-        clock_bits = bitcells[phase::2]
-        data_bits = bitcells[1 - phase :: 2]
-        if not clock_bits:
-            continue
-        clock_density = sum(clock_bits) / len(clock_bits)
-        if clock_density > best_score:
-            best_score = clock_density
-            best_phase = phase
-            chosen_bits = data_bits
-
-    shift, aligned = best_aligned_bytes(chosen_bits)
-    overall_shift = (1 - best_phase + shift) % 8
-    return overall_shift, aligned
+    best, _ = _select_fm_phase_candidates(bitcells)
+    return best.bit_shift, best.bytes_out
 
 
 def brute_force_mark_payloads(

@@ -9,12 +9,15 @@ framing.
 
 from __future__ import annotations
 
+import json
+import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Callable, Dict, Sequence, Tuple
 
-from .fm import crc16_ibm, decode_fm_bytes, pll_decode_fm_bytes
+from .fm import FMPhaseCandidate, crc16_ibm, decode_fm_bytes, pll_decode_fm_bytes
 from .hardsector import HoleCapture, group_hard_sectors, pair_holes
 from .scp import SCPImage, TrackData
 
@@ -27,6 +30,15 @@ class WangSector:
     payload: bytes
     checksum: bytes
     checksum_algorithms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DecodedStream:
+    bytes_out: bytes
+    fm_phase: int
+    phase_candidates: dict[int, FMPhaseCandidate]
+    invert: bool
+    clock_scale: float
 
 
 @dataclass
@@ -47,12 +59,20 @@ class SectorReconstruction:
     confidence: list[float]
     payload_offset: int
     window_score: float
+    window_similarity: float
+    payload_entropy: float
+    payload_fill_ratio: float
+    stream_length: int
+    sector_size: int
+    hole_shift: int
     kept_rotations: list[int]
     dropped_rotations: list[int]
     rotation_similarity: list[RotationSimilarity]
     reference_rotation: int
     shifts: dict[int, int]
     mean_similarity_kept: float
+    phase_consensus: dict[int, bytes]
+    chosen_fm_phase: int
 
 
 ChecksumFunc = Tuple[str, Callable[[bytes], int]]
@@ -99,6 +119,26 @@ def checksum_hits(body: bytes, expected: bytes) -> tuple[str, ...]:
         except Exception:
             continue
     return tuple(hits)
+
+
+def _window_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = Counter(data)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / len(data)
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _fill_ratio_ff00(data: bytes) -> float:
+    if not data:
+        return 1.0
+    counts = Counter(data)
+    zero_ff = counts.get(0x00, 0) + counts.get(0xFF, 0)
+    top = max(counts.values())
+    return max(zero_ff, top) / len(data)
 
 
 def similarity(a: bytes, b: bytes) -> float:
@@ -178,29 +218,71 @@ def _decode_capture(
     capture: HoleCapture,
     use_pll: bool = True,
     clock_adjust: float = 0.10,
-) -> bytes:
+    invert: bool = False,
+    clock_scale: float = 1.0,
+) -> DecodedStream:
+    flux: list[int] = []
+    for idx in capture.revolution_indices:
+        flux.extend(track.decode_flux(idx))
+    if clock_scale != 1.0:
+        flux = [max(1, int(interval * clock_scale)) for interval in flux]
+
     if use_pll:
         result = pll_decode_fm_bytes(
-            [
-                interval
-                for idx in capture.revolution_indices
-                for interval in track.decode_flux(idx)
-            ],
+            flux,
             sample_freq_hz=image.sample_freq_hz,
             index_ticks=capture.index_ticks,
             clock_adjust=clock_adjust,
+            invert=invert,
         )
-        return result.bytes_out
-    return decode_fm_bytes(
-        [
-            interval
-            for idx in capture.revolution_indices
-            for interval in track.decode_flux(idx)
-        ]
-    ).bytes_out
+        candidates = result.phase_candidates or ()
+        candidate_map = {cand.phase: cand for cand in candidates}
+        if not candidate_map:
+            sample = result.bytes_out[:1024]
+            entropy = _window_entropy(sample)
+            fill = _fill_ratio_ff00(sample)
+            candidate_map = {
+                result.fm_phase: FMPhaseCandidate(
+                    phase=result.fm_phase,
+                    bit_shift=result.bit_shift,
+                    bytes_out=result.bytes_out,
+                    entropy=entropy,
+                    fill_ratio=fill,
+                    score=entropy - fill * 2.0,
+                    sample_size=len(sample),
+                )
+            }
+        return DecodedStream(
+            bytes_out=result.bytes_out,
+            fm_phase=result.fm_phase,
+            phase_candidates=candidate_map,
+            invert=invert,
+            clock_scale=clock_scale,
+        )
+
+    decoded = decode_fm_bytes(flux)
+    sample = decoded.bytes_out[:1024]
+    entropy = _window_entropy(sample)
+    fill_ratio = _fill_ratio_ff00(sample)
+    fallback = FMPhaseCandidate(
+        phase=0,
+        bit_shift=decoded.bit_shift,
+        bytes_out=decoded.bytes_out,
+        entropy=entropy,
+        fill_ratio=fill_ratio,
+        score=entropy - fill_ratio * 2.0,
+        sample_size=len(sample),
+    )
+    return DecodedStream(
+        bytes_out=decoded.bytes_out,
+        fm_phase=0,
+        phase_candidates={0: fallback},
+        invert=invert,
+        clock_scale=clock_scale,
+    )
 
 
-def _pairwise_similarity_matrix(streams: Sequence[bytes]) -> list[list[float]]:
+def _pairwise_similarity_matrix(streams: Sequence[DecodedStream]) -> list[list[float]]:
     matrix: list[list[float]] = []
     for i, ref in enumerate(streams):
         row: list[float] = []
@@ -208,7 +290,7 @@ def _pairwise_similarity_matrix(streams: Sequence[bytes]) -> list[list[float]]:
             if i == j:
                 row.append(1.0)
                 continue
-            _, score = best_shift(ref, other)
+            _, score = best_shift(ref.bytes_out, other.bytes_out)
             row.append(score)
         matrix.append(row)
     return matrix
@@ -265,28 +347,79 @@ def consensus_with_confidence(
     return bytes(consensus), confidence
 
 
-def _best_confidence_window(
-    confidence: Sequence[float], window: int
-) -> tuple[int, float]:
-    if not confidence or window <= 0:
-        return 0, 0.0
-    best_off, best_score = 0, -1.0
-    for start in range(0, max(1, len(confidence) - window + 1)):
-        window_conf = confidence[start : start + window]
-        score = sum(window_conf) / window
-        if score > best_score:
-            best_score = score
-            best_off = start
-    return best_off, best_score
+WINDOW_ENTROPY_WEIGHT = 0.4
+WINDOW_FILL_WEIGHT = 1.0
+WINDOW_FILL_REJECTION = 0.85
+
+
+def _window_similarity(
+    consensus: bytes,
+    aligned_streams: Sequence[tuple[int, bytes]],
+    start: int,
+    window: int,
+) -> float:
+    target = consensus[start : start + window]
+    if not target:
+        return 0.0
+    sims: list[float] = []
+    for offset, data in aligned_streams:
+        rel_start = start - offset
+        rel_end = rel_start + window
+        if rel_end <= 0 or rel_start >= len(data):
+            continue
+        data_start = max(rel_start, 0)
+        data_end = min(rel_end, len(data))
+        consensus_start = data_start - rel_start
+        overlap = data_end - data_start
+        if overlap <= 0 or consensus_start >= len(target):
+            continue
+        segment = target[consensus_start : consensus_start + overlap]
+        if not segment:
+            continue
+        sims.append(similarity(segment, data[data_start:data_end]))
+    return sum(sims) / len(sims) if sims else 0.0
+
+
+def _select_payload_window(
+    consensus: bytes, aligned_streams: Sequence[tuple[int, bytes]], window: int
+) -> tuple[int, float, float, float, float]:
+    if window <= 0 or not consensus:
+        return 0, 0.0, 0.0, 0.0, 1.0
+
+    best_accept: tuple[float, int, float, float, float] | None = None
+    best_reject: tuple[float, int, float, float, float] | None = None
+
+    for start in range(0, max(1, len(consensus) - window + 1)):
+        window_bytes = consensus[start : start + window]
+        fill_ratio = _fill_ratio_ff00(window_bytes)
+        entropy = _window_entropy(window_bytes)
+        similarity_score = _window_similarity(consensus, aligned_streams, start, window)
+        score = (
+            similarity_score
+            + WINDOW_ENTROPY_WEIGHT * entropy
+            - WINDOW_FILL_WEIGHT * fill_ratio
+        )
+        bucket = best_accept if fill_ratio <= WINDOW_FILL_REJECTION else best_reject
+        if bucket is None or score > bucket[0]:
+            entry = (score, start, similarity_score, entropy, fill_ratio)
+            if fill_ratio <= WINDOW_FILL_REJECTION:
+                best_accept = entry
+            else:
+                best_reject = entry
+
+    chosen = best_accept or best_reject or (0.0, 0, 0.0, 0.0, 1.0)
+    _, offset, similarity_score, entropy, fill_ratio = chosen
+    return offset, chosen[0], similarity_score, entropy, fill_ratio
 
 
 def _reconstruct_sector(
-    streams: Sequence[bytes],
+    streams: Sequence[DecodedStream],
     track_number: int,
     sector_id: int,
     sector_size: int,
     similarity_threshold: float,
     keep_best: int,
+    hole_shift: int,
 ) -> tuple[WangSector | None, SectorReconstruction | None]:
     if not streams:
         return None, None
@@ -295,7 +428,7 @@ def _reconstruct_sector(
     similarity_stats = _rotation_similarity(matrix)
     reference = max(similarity_stats, key=lambda s: s.mean)
     ref_idx = reference.rotation_index
-    ref_stream = streams[ref_idx]
+    ref_stream = streams[ref_idx].bytes_out
 
     aligned_streams: list[tuple[int, bytes]] = []
     shifts: dict[int, int] = {}
@@ -303,7 +436,7 @@ def _reconstruct_sector(
     dropped: list[int] = []
     sims_to_ref: dict[int, float] = {}
     for idx, stream in enumerate(streams):
-        shift, sim = best_shift(ref_stream, stream)
+        shift, sim = best_shift(ref_stream, stream.bytes_out)
         sims_to_ref[idx] = sim
         similarity_stats[idx].shift = shift
         similarity_stats[idx].similarity_to_reference = sim
@@ -319,14 +452,30 @@ def _reconstruct_sector(
         dropped = [idx for idx in range(len(streams)) if idx not in kept]
 
     for idx in kept:
-        offset, aligned = _apply_shift(streams[idx], shifts[idx])
+        offset, aligned = _apply_shift(streams[idx].bytes_out, shifts[idx])
         aligned_streams.append((offset, aligned))
 
     consensus, confidence = consensus_with_confidence(aligned_streams)
-    payload_offset, window_score = _best_confidence_window(confidence, sector_size)
+    phase_consensus: dict[int, bytes] = {}
+    for phase in (0, 1):
+        phase_streams: list[tuple[int, bytes]] = []
+        for idx in kept:
+            candidate = streams[idx].phase_candidates.get(phase)
+            if not candidate or not candidate.bytes_out:
+                continue
+            offset, aligned_phase = _apply_shift(candidate.bytes_out, shifts[idx])
+            phase_streams.append((offset, aligned_phase))
+        if phase_streams:
+            consensus_phase, _ = consensus_with_confidence(phase_streams)
+            phase_consensus[phase] = consensus_phase
+    payload_offset, window_score, window_similarity, payload_entropy, payload_fill = (
+        _select_payload_window(consensus, aligned_streams, sector_size)
+    )
     payload = consensus[payload_offset : payload_offset + sector_size]
     if len(payload) < sector_size:
         payload = payload.ljust(sector_size, b"\x00")
+        payload_entropy = _window_entropy(payload)
+        payload_fill = _fill_ratio_ff00(payload)
 
     rotation_similarity = [
         RotationSimilarity(
@@ -339,6 +488,12 @@ def _reconstruct_sector(
         )
         for stat in similarity_stats
     ]
+
+    chosen_phase = (
+        Counter(streams[idx].fm_phase for idx in kept).most_common(1)[0][0]
+        if kept
+        else 0
+    )
 
     sector = WangSector(
         track=track_number,
@@ -355,6 +510,12 @@ def _reconstruct_sector(
         confidence=confidence,
         payload_offset=payload_offset,
         window_score=window_score,
+        window_similarity=window_similarity,
+        payload_entropy=payload_entropy,
+        payload_fill_ratio=payload_fill,
+        stream_length=len(consensus),
+        sector_size=sector_size,
+        hole_shift=hole_shift,
         kept_rotations=kept,
         dropped_rotations=dropped,
         rotation_similarity=rotation_similarity,
@@ -363,6 +524,8 @@ def _reconstruct_sector(
         mean_similarity_kept=(
             sum(sims_to_ref[i] for i in kept) / len(kept) if kept else 0.0
         ),
+        phase_consensus=phase_consensus,
+        chosen_fm_phase=chosen_phase,
     )
     return reconstruction.wang_sector, reconstruction
 
@@ -371,12 +534,16 @@ def reconstruct_track(
     image: SCPImage,
     track_number: int,
     sector_size: int = 256,
+    sector_sizes: Sequence[int] | None = None,
     logical_sectors: int = 16,
     pair_phase: int = 0,
     clock_adjust: float = 0.10,
     similarity_threshold: float = 0.75,
     keep_best: int = 5,
     dump_raw: Path | None = None,
+    hole_shifts: Sequence[int] | None = None,
+    invert: bool = False,
+    clock_scale: float = 1.0,
 ) -> tuple[Dict[int, WangSector], dict[int, SectorReconstruction], float]:
     track = image.read_track(track_number)
     if not track:
@@ -389,57 +556,202 @@ def reconstruct_track(
     if not grouping.groups:
         return {}, {}, 0.0
 
-    per_sector_streams: dict[int, list[bytes]] = {i: [] for i in range(logical_sectors)}
-    for rot_idx, rotation in enumerate(grouping.groups):
-        short_pair = None
-        if grouping.short_pair_positions:
-            short_pair = grouping.short_pair_positions[rot_idx]
-        pair_label = (
-            f"({short_pair},{(short_pair + 1) % (grouping.sectors_per_rotation + 1)})"
-            if short_pair is not None
-            else "None"
-        )
-        print(
-            f"  rotation {rot_idx}: short_pair={pair_label} merged_len={len(rotation)} (expected 32)"
-        )
-        assert len(rotation) == 32, "normalize_rotation must yield 32 merged holes"
-        paired = pair_holes(rotation, phase=pair_phase)
-        for pair in paired:
-            raw_bytes = _decode_capture(
+    size_candidates = list(dict.fromkeys(sector_sizes or (128, 256, sector_size)))
+    shift_candidates = list(
+        dict.fromkeys(hole_shifts or range(grouping.sectors_per_rotation))
+    )
+    decoded_cache: dict[tuple[int, tuple[int, ...], float, bool], DecodedStream] = {}
+
+    def decode_pair(rotation_index: int, pair: HoleCapture) -> DecodedStream:
+        key = (rotation_index, tuple(pair.revolution_indices), clock_scale, invert)
+        if key not in decoded_cache:
+            decoded_cache[key] = _decode_capture(
                 image,
                 track,
                 pair,
                 use_pll=True,
                 clock_adjust=clock_adjust,
+                invert=invert,
+                clock_scale=clock_scale,
             )
-            per_sector_streams[pair.logical_sector_index or 0].append(raw_bytes)
+        return decoded_cache[key]
 
-    results: Dict[int, WangSector] = {}
-    reconstructions: dict[int, SectorReconstruction] = {}
-    total_score = 0.0
-    for sid, streams in per_sector_streams.items():
-        sector, reconstruction = _reconstruct_sector(
-            streams,
-            track_number=track_number,
-            sector_id=sid,
-            sector_size=sector_size,
-            similarity_threshold=similarity_threshold,
-            keep_best=keep_best,
+    def reconstruct_for_size(
+        streams: dict[int, list[DecodedStream]],
+        size: int,
+        hole_shift_val: int,
+        sector_limit: int | None = None,
+    ) -> tuple[Dict[int, WangSector], dict[int, SectorReconstruction], float]:
+        results: Dict[int, WangSector] = {}
+        reconstructions: dict[int, SectorReconstruction] = {}
+        total = 0.0
+        processed = 0
+        for sid in sorted(streams):
+            if sector_limit is not None and processed >= sector_limit:
+                break
+            sector_streams = streams[sid]
+            if not sector_streams:
+                continue
+            sector, reconstruction = _reconstruct_sector(
+                sector_streams,
+                track_number=track_number,
+                sector_id=sid,
+                sector_size=size,
+                similarity_threshold=similarity_threshold,
+                keep_best=keep_best,
+                hole_shift=hole_shift_val,
+            )
+            if sector and reconstruction:
+                results[sid] = sector
+                reconstructions[sid] = reconstruction
+                total += reconstruction.window_score
+                processed += 1
+        return results, reconstructions, total
+
+    best_shift_streams: dict[int, list[DecodedStream]] | None = None
+    best_shift_score = -math.inf
+    best_shift_sector_count = -1
+    best_shift = 0
+    shift_score_size = (
+        sector_size if sector_size in size_candidates else size_candidates[0]
+    )
+
+    for hole_shift in shift_candidates:
+        per_sector_streams: dict[int, list[DecodedStream]] = {
+            i: [] for i in range(logical_sectors)
+        }
+        for rot_idx, rotation in enumerate(grouping.groups):
+            assert (
+                len(rotation) == grouping.sectors_per_rotation
+            ), "normalize_rotation must yield merged holes"
+            paired = pair_holes(
+                rotation[hole_shift:] + rotation[:hole_shift], phase=pair_phase
+            )
+            for pair in paired:
+                decoded = decode_pair(rot_idx, pair)
+                per_sector_streams[pair.logical_sector_index or 0].append(decoded)
+
+        shift_results, _, shift_score = reconstruct_for_size(
+            per_sector_streams,
+            shift_score_size,
+            hole_shift,
+            sector_limit=min(logical_sectors, 4),
         )
-        if sector and reconstruction:
-            results[sid] = sector
-            reconstructions[sid] = reconstruction
-            total_score += reconstruction.window_score
-            if dump_raw:
-                base = dump_raw / f"track{track_number:03d}_sector{sid:02d}"
-                base.parent.mkdir(parents=True, exist_ok=True)
-                (base.parent / f"{base.name}_consensus.bin").write_bytes(
-                    reconstruction.consensus
+        shift_sector_count = len(shift_results)
+        if shift_score > best_shift_score or (
+            math.isclose(shift_score, best_shift_score)
+            and shift_sector_count > best_shift_sector_count
+        ):
+            best_shift_score = shift_score
+            best_shift_sector_count = shift_sector_count
+            best_shift_streams = per_sector_streams
+            best_shift = hole_shift
+
+    if best_shift_streams is None:
+        return {}, {}, 0.0
+
+    best_results: Dict[int, WangSector] | None = None
+    best_recon: dict[int, SectorReconstruction] | None = None
+    best_streams: dict[int, list[DecodedStream]] | None = None
+    best_score = -math.inf
+    best_len = -1
+    best_size = size_candidates[0]
+
+    for size in size_candidates:
+        results, reconstructions, score = reconstruct_for_size(
+            best_shift_streams, size, best_shift
+        )
+        sector_count = len(results)
+        if score > best_score or (
+            math.isclose(score, best_score) and sector_count > best_len
+        ):
+            best_score = score
+            best_len = sector_count
+            best_results = results
+            best_recon = reconstructions
+            best_streams = best_shift_streams
+            best_size = size
+
+    if best_results is None or best_recon is None or best_streams is None:
+        return {}, {}, 0.0
+
+    all_streams = [stream for streams in best_streams.values() for stream in streams]
+    phase_buckets: dict[int, list[FMPhaseCandidate]] = {0: [], 1: []}
+    for stream in all_streams:
+        for phase, candidate in stream.phase_candidates.items():
+            phase_buckets.setdefault(phase, []).append(candidate)
+    phase_stats = {
+        phase: (
+            sum(c.entropy for c in candidates) / len(candidates) if candidates else 0.0,
+            (
+                sum(c.fill_ratio for c in candidates) / len(candidates)
+                if candidates
+                else 1.0
+            ),
+        )
+        for phase, candidates in phase_buckets.items()
+    }
+    median_length = int(
+        median(len(stream.bytes_out) for stream in all_streams) if all_streams else 0
+    )
+    chosen_phase = (
+        Counter(stream.fm_phase for stream in all_streams).most_common(1)[0][0]
+        if all_streams
+        else 0
+    )
+    print(
+        "  FM phase selection: "
+        f"chosen={chosen_phase} "
+        f"phase0(entropy={phase_stats.get(0, (0.0, 1.0))[0]:.2f},"
+        f" fill={phase_stats.get(0, (0.0, 1.0))[1]:.3f}) "
+        f"phase1(entropy={phase_stats.get(1, (0.0, 1.0))[0]:.2f},"
+        f" fill={phase_stats.get(1, (0.0, 1.0))[1]:.3f}) "
+        f"decoded_len_med={median_length}"
+    )
+    print(
+        f"  Selected sector_size={best_size} hole_shift={best_shift} "
+        f"score={best_score:.2f} sectors={best_len}"
+    )
+
+    if dump_raw:
+        for sid, reconstruction in best_recon.items():
+            base = dump_raw / f"track{track_number:03d}_sector{sid:02d}"
+            base.parent.mkdir(parents=True, exist_ok=True)
+            (base.parent / f"{base.name}_consensus.bin").write_bytes(
+                reconstruction.consensus
+            )
+            (base.parent / f"{base.name}_payload.bin").write_bytes(
+                reconstruction.wang_sector.payload
+            )
+            conf_text = "\n".join(f"{c:.3f}" for c in reconstruction.confidence)
+            (base.parent / f"{base.name}_confidence.txt").write_text(conf_text)
+            (base.parent / f"{base.name}_stream.bin").write_bytes(
+                reconstruction.consensus
+            )
+            for phase, stream_bytes in reconstruction.phase_consensus.items():
+                (base.parent / f"{base.name}_stream_phase{phase}.bin").write_bytes(
+                    stream_bytes
                 )
-                (base.parent / f"{base.name}_payload.bin").write_bytes(sector.payload)
-                conf_text = "\n".join(f"{c:.3f}" for c in reconstruction.confidence)
-                (base.parent / f"{base.name}_confidence.txt").write_text(conf_text)
-    return results, reconstructions, total_score
+            meta = {
+                "track": track_number,
+                "sector": sid,
+                "sector_size": reconstruction.sector_size,
+                "hole_shift": reconstruction.hole_shift,
+                "chosen_fm_phase": reconstruction.chosen_fm_phase,
+                "invert": invert,
+                "clock_scale": clock_scale,
+                "payload_offset": reconstruction.payload_offset,
+                "window_score": reconstruction.window_score,
+                "window_similarity": reconstruction.window_similarity,
+                "payload_entropy": reconstruction.payload_entropy,
+                "payload_fill_ratio": reconstruction.payload_fill_ratio,
+                "stream_length": reconstruction.stream_length,
+            }
+            (base.parent / f"{base.name}_meta.json").write_text(
+                json.dumps(meta, indent=2)
+            )
+
+    return best_results, best_recon, best_score
 
 
 def summarize_wang_map(wang_map: Dict[int, WangSector]) -> str:
