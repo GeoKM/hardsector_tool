@@ -66,6 +66,7 @@ class SectorReconstruction:
     window_similarity: float
     payload_entropy: float
     payload_fill_ratio: float
+    payload_gap: bool
     stream_length: int
     sector_size: int
     hole_shift: int
@@ -542,9 +543,17 @@ def consensus_with_confidence(
     return bytes(consensus), confidence
 
 
-WINDOW_ENTROPY_WEIGHT = 0.4
-WINDOW_FILL_WEIGHT = 1.0
-WINDOW_FILL_REJECTION = 0.85
+WINDOW_ENTROPY_WEIGHT = 0.6
+WINDOW_FILL_WEIGHT = 1.5
+WINDOW_GAP_FILL_THRESHOLD = 0.80
+WINDOW_GAP_ENTROPY_THRESHOLD = 2.5
+
+
+def _is_gap_payload(fill_ratio: float, entropy: float) -> bool:
+    return (
+        fill_ratio >= WINDOW_GAP_FILL_THRESHOLD
+        and entropy < WINDOW_GAP_ENTROPY_THRESHOLD
+    )
 
 
 def _window_similarity(
@@ -581,8 +590,8 @@ def _select_payload_window(
     if window <= 0 or not consensus:
         return 0, 0.0, 0.0, 0.0, 1.0
 
-    best_accept: tuple[float, int, float, float, float] | None = None
-    best_reject: tuple[float, int, float, float, float] | None = None
+    best_valid: tuple[float, int, float, float, float] | None = None
+    best_invalid: tuple[float, int, float, float, float] | None = None
 
     for start in range(0, max(1, len(consensus) - window + 1)):
         window_bytes = consensus[start : start + window]
@@ -594,15 +603,16 @@ def _select_payload_window(
             + WINDOW_ENTROPY_WEIGHT * entropy
             - WINDOW_FILL_WEIGHT * fill_ratio
         )
-        bucket = best_accept if fill_ratio <= WINDOW_FILL_REJECTION else best_reject
+        is_gap = _is_gap_payload(fill_ratio, entropy)
+        bucket = best_invalid if is_gap else best_valid
         if bucket is None or score > bucket[0]:
             entry = (score, start, similarity_score, entropy, fill_ratio)
-            if fill_ratio <= WINDOW_FILL_REJECTION:
-                best_accept = entry
+            if is_gap:
+                best_invalid = entry
             else:
-                best_reject = entry
+                best_valid = entry
 
-    chosen = best_accept or best_reject or (0.0, 0, 0.0, 0.0, 1.0)
+    chosen = best_valid or best_invalid or (0.0, 0, 0.0, 0.0, 1.0)
     _, offset, similarity_score, entropy, fill_ratio = chosen
     return offset, chosen[0], similarity_score, entropy, fill_ratio
 
@@ -671,6 +681,7 @@ def _reconstruct_sector(
         payload = payload.ljust(sector_size, b"\x00")
         payload_entropy = _window_entropy(payload)
         payload_fill = _fill_ratio_ff00(payload)
+    payload_gap = _is_gap_payload(payload_fill, payload_entropy)
 
     phase_window_scores: dict[int, list[tuple[float, float]]] = {}
     phase_warning: str | None = None
@@ -732,6 +743,7 @@ def _reconstruct_sector(
         payload = phase_payloads[chosen_phase]
         payload_entropy = _window_entropy(payload)
         payload_fill = _fill_ratio_ff00(payload)
+        payload_gap = _is_gap_payload(payload_fill, payload_entropy)
 
     transform_results: list[TransformResult] = []
     for phase, segment in phase_payloads.items():
@@ -795,6 +807,7 @@ def _reconstruct_sector(
         window_similarity=window_similarity,
         payload_entropy=payload_entropy,
         payload_fill_ratio=payload_fill,
+        payload_gap=payload_gap,
         stream_length=len(consensus),
         sector_size=sector_size,
         hole_shift=hole_shift,
@@ -822,7 +835,9 @@ def reconstruct_track(
     sector_size: int = 256,
     sector_sizes: Sequence[int] | None = None,
     logical_sectors: int = 16,
+    sectors_per_rotation: int = 32,
     pair_phase: int = 0,
+    pair_hole_windows: bool = True,
     clock_adjust: float = 0.10,
     similarity_threshold: float = 0.75,
     keep_best: int = 5,
@@ -836,7 +851,7 @@ def reconstruct_track(
         return {}, {}, 0.0
     grouping = group_hard_sectors(
         track,
-        sectors_per_rotation=32,
+        sectors_per_rotation=sectors_per_rotation,
         index_aligned=bool(image.header.flags & 0x01),
     )
     if not grouping.groups:
@@ -910,12 +925,31 @@ def reconstruct_track(
             assert (
                 len(rotation) == grouping.sectors_per_rotation
             ), "normalize_rotation must yield merged holes"
-            paired = pair_holes(
-                rotation[hole_shift:] + rotation[:hole_shift], phase=pair_phase
-            )
-            for pair in paired:
-                decoded = decode_pair(rot_idx, pair)
-                per_sector_streams[pair.logical_sector_index or 0].append(decoded)
+            shifted = rotation[hole_shift:] + rotation[:hole_shift]
+            captures: Sequence[HoleCapture]
+            if pair_hole_windows:
+                captures = pair_holes(shifted, phase=pair_phase)
+            else:
+                captures = [
+                    HoleCapture(
+                        hole_index=hole.hole_index,
+                        revolution_indices=hole.revolution_indices,
+                        index_ticks=hole.index_ticks,
+                        flux_count=hole.flux_count,
+                        logical_sector_index=hole.hole_index,
+                    )
+                    for hole in shifted
+                ]
+            for capture in captures:
+                decoded = decode_pair(rot_idx, capture)
+                logical_index = (
+                    capture.logical_sector_index
+                    if capture.logical_sector_index is not None
+                    else capture.hole_index
+                )
+                if logical_index is None:
+                    continue
+                per_sector_streams.setdefault(logical_index, []).append(decoded)
 
         shift_results, _, shift_score = reconstruct_for_size(
             per_sector_streams,
@@ -1028,7 +1062,7 @@ def reconstruct_track(
         f"ones_ratio_data_phase={data_phase_ones:.3f} "
         f"ones_ratio_clock_phase={clock_phase_ones:.3f}"
     )
-    if decoded_fill > 0.85 and decoded_entropy < 1.0:
+    if _is_gap_payload(decoded_fill, decoded_entropy):
         print(
             "   WARNING: decoded bytes look like gap/clock (mostly FF/00); "
             "likely wrong phase or wrong window offset"
@@ -1129,6 +1163,7 @@ def reconstruct_track(
                 "window_similarity": reconstruction.window_similarity,
                 "payload_entropy": reconstruction.payload_entropy,
                 "payload_fill_ratio": reconstruction.payload_fill_ratio,
+                "payload_gap": reconstruction.payload_gap,
                 "stream_length": reconstruction.stream_length,
                 "phase_window_stats": reconstruction.phase_window_stats,
                 "phase_warning": reconstruction.phase_warning,

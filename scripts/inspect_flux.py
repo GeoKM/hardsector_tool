@@ -362,6 +362,19 @@ def main() -> None:
         help="Run Wang/OIS HS32 pairing, voting, and checksum sweep.",
     )
     parser.add_argument(
+        "--wang-no-pairing",
+        action="store_true",
+        help="Treat each hard-sector window as its own sector (32/track) when decoding Wang/OIS.",
+    )
+    parser.add_argument(
+        "--wang-sector-count",
+        "--sector-count",
+        dest="wang_sector_count",
+        type=int,
+        default=None,
+        help="Logical sector count to target for Wang/OIS decoding (default 16 when pairing, 32 when --wang-no-pairing).",
+    )
+    parser.add_argument(
         "--dump-wang-raw",
         type=Path,
         default=None,
@@ -1167,6 +1180,14 @@ def main() -> None:
             print("\nNo tracks selected for Wang/OIS decoding.")
         else:
             print("\nWang/OIS HS32 reconstruction:")
+            wang_sector_count = args.logical_sectors
+            wang_pair_holes = not args.wang_no_pairing
+            if args.wang_sector_count is not None:
+                wang_sector_count = args.wang_sector_count
+                if args.wang_sector_count >= args.physical_sectors:
+                    wang_pair_holes = False
+            elif args.wang_no_pairing:
+                wang_sector_count = args.physical_sectors
             for t in candidates:
                 best_map: dict[int, object] | None = None
                 best_recon: dict[int, object] | None = None
@@ -1179,8 +1200,10 @@ def main() -> None:
                         image,
                         t,
                         sector_size=args.sector_size,
-                        logical_sectors=args.logical_sectors,
+                        logical_sectors=wang_sector_count,
+                        sectors_per_rotation=args.physical_sectors,
                         pair_phase=phase,
+                        pair_hole_windows=wang_pair_holes,
                         clock_adjust=args.clock_adjust,
                         dump_raw=args.dump_wang_raw,
                     )
@@ -1224,7 +1247,14 @@ def main() -> None:
                                 f"{int(rec.best_transform.invert)}_br"
                                 f"{int(rec.best_transform.bit_reverse)}"
                             )
-                            if rec.best_transform.checksum_hits:
+                            if rec.payload_gap:
+                                print(
+                                    "    checksum sweep: "
+                                    f"{transform_label} skipped (gap-like payload: "
+                                    f"fill={rec.payload_fill_ratio:.3f} "
+                                    f"entropy={rec.payload_entropy:.2f})"
+                                )
+                            elif rec.best_transform.checksum_hits:
                                 hit_names = ", ".join(
                                     hit.algorithm
                                     for hit in rec.best_transform.checksum_hits
@@ -1249,7 +1279,7 @@ def main() -> None:
                         )
                         print(f"  Checksum hit tally: {tally}")
                     header_hits = detect_header_candidates(
-                        best_recon, args.logical_sectors, t
+                        best_recon, wang_sector_count, t
                     )
                     if header_hits.get("track") or header_hits.get("sector"):
                         track_part = (
