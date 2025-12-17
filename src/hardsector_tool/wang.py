@@ -433,12 +433,12 @@ def reconstruct_track(
             if dump_raw:
                 base = dump_raw / f"track{track_number:03d}_sector{sid:02d}"
                 base.parent.mkdir(parents=True, exist_ok=True)
-                (base.with_suffix("_consensus.bin")).write_bytes(
+                (base.parent / f"{base.name}_consensus.bin").write_bytes(
                     reconstruction.consensus
                 )
-                (base.with_suffix("_payload.bin")).write_bytes(sector.payload)
+                (base.parent / f"{base.name}_payload.bin").write_bytes(sector.payload)
                 conf_text = "\n".join(f"{c:.3f}" for c in reconstruction.confidence)
-                (base.with_suffix("_confidence.txt")).write_text(conf_text)
+                (base.parent / f"{base.name}_confidence.txt").write_text(conf_text)
     return results, reconstructions, total_score
 
 
