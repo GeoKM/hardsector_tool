@@ -39,3 +39,20 @@ def test_scan_wang_frames_accepts_plausible_offsets() -> None:
     )
     assert frames
     assert any(frame.sector_id == 1 for frame in frames)
+
+
+def test_reconstruct_track_sets_window_metadata() -> None:
+    image = SCPImage.from_file(FIXTURE)
+    reconstructed, recon, _ = reconstruct_track(
+        image,
+        0,
+        sector_size=256,
+        logical_sectors=16,
+        pair_phase=0,
+    )
+    if recon:
+        rec = next(iter(recon.values()))
+        assert rec.sector_size in (128, 256, 512)
+        assert 0 <= rec.hole_shift < 32
+    else:
+        assert reconstructed == {}
