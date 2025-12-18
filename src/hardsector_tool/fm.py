@@ -63,6 +63,7 @@ class SectorGuess:
     id_crc_ok: bool
     data_crc_ok: bool
     data: Optional[bytes] = None
+    decode_score: float | None = None
 
 
 @dataclass(frozen=True)
