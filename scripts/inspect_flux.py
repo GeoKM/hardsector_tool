@@ -170,6 +170,12 @@ def main() -> None:
         help="Physical hard-sector holes per rotation (post index-merge).",
     )
     parser.add_argument(
+        "--hs-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize hard-sector captures by merging the index split (default: on).",
+    )
+    parser.add_argument(
         "--logical-sectors",
         type=int,
         default=16,
@@ -386,6 +392,11 @@ def main() -> None:
         help="Print normalized hole timings and highlight short index-split pair.",
     )
     parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Report hard-sector geometry and interval integrity per selected track.",
+    )
+    parser.add_argument(
         "--auto-invert",
         action="store_true",
         help="Try both bitcell polarities and pick the higher-scoring candidate.",
@@ -487,11 +498,13 @@ def main() -> None:
                 track,
                 sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
+                hs_normalize=args.hs_normalize,
             )
+            merged_count = len(grouping.groups[0]) if grouping.groups else 0
             print(
                 f"\nHard-sector summary (track {tracks[0]}): "
                 f"{grouping.rotations} rotations, "
-                f"{len(grouping.groups[0])} merged intervals (raw {grouping.sectors_per_rotation + 1}) "
+                f"{merged_count} sector windows (raw {grouping.pulses_per_rotation}) "
                 f"(rotated_by={grouping.rotated_by}, index_conf={grouping.index_confidence:.2f})"
             )
             if grouping.short_pair_positions:
@@ -501,6 +514,12 @@ def main() -> None:
                         f" Index-split short pair starts at capture {short} "
                         f"(holes {short} & {(short + 1) % (args.physical_sectors + 1)})"
                     )
+            if grouping.index_pair_position is not None:
+                print(
+                    f" Detected index pair offset (pre-rotation): {grouping.index_pair_position}"
+                )
+            if grouping.detection_notes:
+                print(f" Detection note: {grouping.detection_notes}")
             if args.show_hole_timing and grouping.groups:
                 durations = [h.index_ticks for h in grouping.groups[0]]
                 med = median(durations) if durations else 0
@@ -549,6 +568,60 @@ def main() -> None:
                             f"flux={diag['flux_total']} idx={diag['index_ticks']} "
                             f"delta={diag['delta']} ratio={diag['ratio']:.3f}"
                         )
+
+    if args.report:
+        report_tracks = tracks_for_bulk() or tracks
+        print("\nHard-sector report:")
+        for t in report_tracks:
+            track = image.read_track(t)
+            if not track:
+                print(f" Track {t}: no data present")
+                continue
+            grouping = group_hard_sectors(
+                track,
+                sectors_per_rotation=args.physical_sectors,
+                index_aligned=bool(hdr.flags & 0x01),
+                hs_normalize=args.hs_normalize,
+            )
+            if not grouping.groups:
+                print(f" Track {t}: no hard-sector groups detected")
+                continue
+            merged_count = len(grouping.groups[0])
+            missing_pairs = sum(
+                1 for pos in (grouping.short_pair_positions or []) if pos is None
+            )
+            print(
+                f" Track {t}: pulses_per_rev={grouping.pulses_per_rotation} "
+                f"rotations={grouping.rotations} sectors_per_rev={merged_count} "
+                f"rotated_by={grouping.rotated_by}"
+            )
+            if grouping.index_pair_position is not None:
+                print(
+                    f"  index pair offset (pre-rotation): {grouping.index_pair_position}"
+                )
+            if grouping.short_pair_positions:
+                short_positions = ", ".join(
+                    "-" if pos is None else str(pos)
+                    for pos in grouping.short_pair_positions
+                )
+                print(f"  short pairs per rotation: {short_positions}")
+            if missing_pairs:
+                print(f"  Warning: {missing_pairs} rotations missing short-pair match")
+            if grouping.detection_notes:
+                print(f"  detection note: {grouping.detection_notes}")
+            diagnostics = compute_flux_index_diagnostics(
+                track, grouping, rotation_index=0
+            )
+            if diagnostics:
+                deltas = [d["delta"] for d in diagnostics]
+                ratios = [d["ratio"] for d in diagnostics if d["index_ticks"]]
+                ratio_str = f"{min(ratios):.3f}..{max(ratios):.3f}" if ratios else "n/a"
+                print(
+                    "  flux-index delta range rot0: "
+                    f"{min(deltas)}..{max(deltas)} ratio {ratio_str}"
+                )
+            else:
+                print("  flux-index diagnostics unavailable for rotation 0")
 
     if args.decode_fm and tracks:
         target_track = tracks[0]
@@ -629,6 +702,7 @@ def main() -> None:
                 track,
                 sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
+                hs_normalize=args.hs_normalize,
             )
             stitched_flux, stitched_ticks = stitch_rotation_flux(
                 track, grouping, rotation_index=0, compensate_gaps=args.stitch_gap_comp
@@ -712,6 +786,7 @@ def main() -> None:
                 track,
                 sectors_per_rotation=args.physical_sectors,
                 index_aligned=bool(hdr.flags & 0x01),
+                hs_normalize=args.hs_normalize,
             )
             rotation = min(args.rotation, grouping.rotations - 1)
             guesses = assemble_rotation(
@@ -802,6 +877,7 @@ def main() -> None:
                     calibrate_rotation=args.calibrate_rotation,
                     synthetic_from_holes=args.synthetic_from_holes,
                     clock_adjust=args.clock_adjust,
+                    hs_normalize=args.hs_normalize,
                 )
                 track_maps[t] = best_map
             raw = build_raw_image(
@@ -829,6 +905,7 @@ def main() -> None:
                     track,
                     sectors_per_rotation=args.physical_sectors,
                     index_aligned=bool(hdr.flags & 0x01),
+                    hs_normalize=args.hs_normalize,
                 )
                 if not grouping.groups:
                     continue
@@ -859,6 +936,9 @@ def main() -> None:
                         encoding=args.encoding,
                         initial_clock_ticks=None,
                         clock_adjust=args.clock_adjust,
+                        invert_bits=args.invert_bitcells,
+                        invert_flux=args.invert_flux,
+                        clock_scale=args.clock_scale,
                     )
                     if args.invert_bytes:
                         data = bytes(~b & 0xFF for b in data)
@@ -912,6 +992,7 @@ def main() -> None:
                     track,
                     sectors_per_rotation=args.physical_sectors,
                     index_aligned=bool(hdr.flags & 0x01),
+                    hs_normalize=args.hs_normalize,
                 )
                 if not grouping.groups:
                     continue

@@ -17,14 +17,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .fm import (
     DEFAULT_CLOCK_ADJ,
+    FMPhaseCandidate,
     SectorGuess,
+    _select_fm_phase_candidates,
+    bits_to_bytes,
     decode_fm_bytes,
-    decode_mfm_bytes,
     estimate_cell_ticks,
-    pll_decode_fm_bytes,
+    pll_decode_bits,
     scan_fm_sectors,
 )
-from .scp import RevolutionEntry, SCPImage, TrackData
+from .scp import SCPImage, TrackData
 
 
 @dataclass(frozen=True)
@@ -53,10 +55,29 @@ class HardSectorGrouping:
     index_confidence: float = 0.0
     index_aligned_flag: Optional[bool] = None
     short_pair_positions: List[Optional[int]] | None = None
+    pulses_per_rotation: int = 33
+    index_pair_position: Optional[int] = None
+    short_intervals: tuple[int, ...] | None = None
+    detection_notes: str | None = None
 
     @property
     def rotations(self) -> int:
         return len(self.groups)
+
+    @property
+    def physical_revolutions(self) -> int:
+        return len(self.groups)
+
+
+@dataclass(frozen=True)
+class SectorWindowDecode:
+    bytes_out: bytes
+    phase: int
+    bit_shift: int
+    score: float
+    bitcells: tuple[int, ...]
+    candidates: tuple[FMPhaseCandidate, ...] | None = None
+    encoding: str = "fm"
 
 
 FORMAT_PRESETS = {
@@ -114,21 +135,37 @@ def best_payload_windows(
     ]
 
 
-def _detect_index_hole_offset(
-    revs: Sequence[RevolutionEntry], holes_per_rotation: int
-) -> Tuple[int, float]:
+def _detect_short_pair_position(
+    intervals: Sequence[int], threshold_scale: float = 0.75
+) -> tuple[Optional[int], float, tuple[int, ...]]:
     """
-    Heuristically locate the index-hole entry within the first rotation.
-    Returns (offset, confidence_ratio).
+    Locate two consecutive short intervals that represent the split index hole.
+
+    Returns (start_index, median_interval, short_indices). The start_index is
+    chosen from adjacent short intervals whose combined duration is closest to
+    the median interval length.
     """
-    if not revs:
-        return 0, 0.0
-    window = revs[:holes_per_rotation]
-    ticks = [rev.index_ticks for rev in window]
-    max_idx = max(range(len(ticks)), key=ticks.__getitem__)
-    med = median(ticks) if len(ticks) > 1 else ticks[0] if ticks else 0.0
-    confidence = (ticks[max_idx] / med) if med else 0.0
-    return max_idx, confidence
+    if not intervals:
+        return None, 0.0, ()
+
+    med = median(intervals)
+    cutoff = med * threshold_scale
+    short_indices = tuple(idx for idx, val in enumerate(intervals) if val < cutoff)
+    if len(short_indices) < 2:
+        return None, med, short_indices
+
+    best: tuple[float, int] | None = None
+    for idx in short_indices:
+        nxt = (idx + 1) % len(intervals)
+        if nxt not in short_indices:
+            continue
+        combined = intervals[idx] + intervals[nxt]
+        closeness = abs(combined - med)
+        if best is None or closeness < best[0]:
+            best = (closeness, idx)
+    if best is None:
+        return None, med, short_indices
+    return best[1], med, short_indices
 
 
 def _rotate_list(values: Sequence, offset: int) -> list:
@@ -138,8 +175,20 @@ def _rotate_list(values: Sequence, offset: int) -> list:
     return list(values[adj:] + values[:adj])
 
 
+def _score_candidate_bytes(candidate: bytes) -> float:
+    if not candidate:
+        return -math.inf
+    fill, entropy = payload_metrics(candidate[:1024])
+    mark_score = sum(
+        candidate.count(mark) for mark in (0xFE, 0xFB, 0xFA, 0xA1, 0x4E, 0xF6)
+    )
+    return mark_score * 4 + entropy - fill * 2.0
+
+
 def normalize_rotation(
     hole_captures: Sequence[HoleCapture],
+    expected_pair_start: int | None = None,
+    threshold_scale: float = 0.75,
 ) -> Tuple[List[HoleCapture], Optional[int]]:
     """
     Merge the index split in a 33-hole capture into 32 uniform intervals.
@@ -153,24 +202,11 @@ def normalize_rotation(
     if len(hole_captures) < 3:
         return list(hole_captures), None
 
-    med = median(h.index_ticks for h in hole_captures)
-    cutoff = med * 0.75 if med else 0
-    short_indices = [
-        idx for idx, h in enumerate(hole_captures) if h.index_ticks < cutoff
-    ]
-
-    def find_adjacent_pair() -> Optional[int]:
-        best: tuple[int, int] | None = None
-        for idx in short_indices:
-            nxt = (idx + 1) % len(hole_captures)
-            if nxt not in short_indices:
-                continue
-            combined = hole_captures[idx].index_ticks + hole_captures[nxt].index_ticks
-            if best is None or combined < best[0]:
-                best = (combined, idx)
-        return best[1] if best else None
-
-    short_pair_start = find_adjacent_pair()
+    short_pair_start = expected_pair_start
+    if short_pair_start is None:
+        short_pair_start, _, _ = _detect_short_pair_position(
+            [h.index_ticks for h in hole_captures], threshold_scale=threshold_scale
+        )
     merged: List[HoleCapture] = []
     skip: set[int] = set()
     for idx, hole in enumerate(hole_captures):
@@ -202,6 +238,86 @@ def normalize_rotation(
         )
 
     return merged, short_pair_start
+
+
+def _flatten_flux(
+    track: TrackData,
+    hole_capture: HoleCapture,
+    invert_flux: bool = False,
+    clock_scale: float = 1.0,
+) -> list[int]:
+    flux: list[int] = []
+    for idx in hole_capture.revolution_indices:
+        part = track.decode_flux(idx)
+        if invert_flux:
+            part = list(reversed(part))
+        if clock_scale != 1.0:
+            part = [max(1, int(x * clock_scale)) for x in part]
+        flux.extend(part)
+    return flux
+
+
+def decode_sector_window_bytes(
+    image: SCPImage,
+    track: TrackData,
+    hole_capture: HoleCapture,
+    encoding: str = "fm",
+    invert_bits: bool = False,
+    invert_flux: bool = False,
+    initial_clock_ticks: float | None = None,
+    clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    clock_scale: float = 1.0,
+) -> SectorWindowDecode:
+    """
+    Decode one normalized sector window and score both FM phases.
+
+    The decode score blends FM phase heuristics with byte-level entropy/mark
+    counts so each sector window can be ranked independently.
+    """
+
+    flux = _flatten_flux(
+        track, hole_capture, invert_flux=invert_flux, clock_scale=clock_scale
+    )
+    bitcells = pll_decode_bits(
+        flux,
+        sample_freq_hz=image.sample_freq_hz,
+        index_ticks=hole_capture.index_ticks,
+        clock_adjust=clock_adjust,
+        initial_clock_ticks=initial_clock_ticks,
+        invert=invert_bits,
+    )
+
+    if encoding.lower() == "mfm":
+        best: SectorWindowDecode | None = None
+        for phase in (0, 1):
+            data_bits = bitcells[phase::2]
+            decoded = bits_to_bytes(data_bits)
+            score = _score_candidate_bytes(decoded)
+            candidate = SectorWindowDecode(
+                bytes_out=decoded,
+                phase=phase,
+                bit_shift=phase,
+                score=score,
+                bitcells=tuple(bitcells),
+                candidates=None,
+                encoding="mfm",
+            )
+            if best is None or candidate.score > best.score:
+                best = candidate
+        assert best is not None
+        return best
+
+    best_phase, candidates = _select_fm_phase_candidates(bitcells)
+    score = _score_candidate_bytes(best_phase.bytes_out) + best_phase.score
+    return SectorWindowDecode(
+        bytes_out=best_phase.bytes_out,
+        phase=best_phase.phase,
+        bit_shift=best_phase.bit_shift,
+        score=score,
+        bitcells=tuple(bitcells),
+        candidates=candidates,
+        encoding="fm",
+    )
 
 
 def pair_holes(holes: Sequence[HoleCapture], phase: int = 0) -> List[HoleCapture]:
@@ -239,38 +355,62 @@ def group_hard_sectors(
     sectors_per_rotation: int = 32,
     index_aligned: bool = True,
     require_strong_index: bool = False,
+    hs_normalize: bool = True,
+    threshold_scale: float = 0.75,
 ) -> HardSectorGrouping:
     """
-    Chunk revolutions into rotations based on the expected hole count.
+    Chunk hard-sector pulses into physical rotations.
 
-    If the SCP FLAGS indicate capture did not begin immediately after index
-    (index_aligned=False), we rotate the revolution list so each grouping
-    starts with the entry whose index_ticks stands out as the index hole.
+    Each SCP "revolution" is a pulse interval between hard-sector holes. For
+    HS32 captures, there are 33 intervals per physical rotation (32 sector
+    holes plus an index hole that splits one interval into two short spans).
+
+    This function identifies the split index interval (two consecutive short
+    entries), rotates the capture so each rotation begins at that index, and
+    optionally merges the index-split pair to yield 32 sector windows.
     """
-    holes_per_rotation = sectors_per_rotation + 1
+    pulses_per_rotation = sectors_per_rotation + 1
     revs = list(track.revolutions)
-    ordered_indices = list(range(len(track.revolutions)))
-    rotated_by = 0
+    ordered_indices = list(range(len(revs)))
+
+    base_intervals = [rev.index_ticks for rev in revs]
+    detection_window = (
+        base_intervals[:pulses_per_rotation]
+        if len(base_intervals) >= pulses_per_rotation
+        else base_intervals
+    )
+    short_pair, med_interval, short_indices = _detect_short_pair_position(
+        detection_window, threshold_scale=threshold_scale
+    )
+    rotated_by = short_pair % pulses_per_rotation if short_pair is not None else 0
+    detection_notes = None
+    if short_pair is None:
+        detection_notes = "No adjacent short intervals found; using raw capture order."
+        rotated_by = 0
+
     confidence = 0.0
+    if med_interval and short_pair is not None and base_intervals:
+        confidence = 1.0 - (
+            abs(base_intervals[rotated_by] - (med_interval / 2)) / max(med_interval, 1)
+        )
+
+    if rotated_by and (not index_aligned or not require_strong_index):
+        revs = _rotate_list(revs, rotated_by)
+        ordered_indices = _rotate_list(ordered_indices, rotated_by)
 
     groups: List[List[HoleCapture]] = []
     short_pairs: List[Optional[int]] = []
-    for rot_idx, base in enumerate(range(0, len(revs), holes_per_rotation)):
-        chunk = revs[base : base + holes_per_rotation]
-        if len(chunk) < holes_per_rotation:
+    for _rot_idx, base in enumerate(range(0, len(revs), pulses_per_rotation)):
+        chunk = revs[base : base + pulses_per_rotation]
+        if len(chunk) < pulses_per_rotation:
             break
-        chunk_indices = ordered_indices[base : base + holes_per_rotation]
+        chunk_indices = ordered_indices[base : base + pulses_per_rotation]
 
-        offset, chunk_conf = _detect_index_hole_offset(chunk, holes_per_rotation)
-        if rot_idx == 0:
-            confidence = chunk_conf
-            rotated_by = offset if offset else 0
-        should_rotate = (not index_aligned and offset != 0) or (
-            offset != 0 and chunk_conf > 1.1 and not require_strong_index
+        local_intervals = [rev.index_ticks for rev in chunk]
+        local_pair, _med, _shorts = _detect_short_pair_position(
+            local_intervals, threshold_scale=threshold_scale
         )
-        if should_rotate:
-            chunk = _rotate_list(chunk, offset)
-            chunk_indices = _rotate_list(chunk_indices, offset)
+        pair_start = local_pair if local_pair is not None else short_pair
 
         captures: List[HoleCapture] = []
         for idx, rev in enumerate(chunk):
@@ -282,9 +422,15 @@ def group_hard_sectors(
                     flux_count=rev.flux_count,
                 )
             )
-        captures, short_pair = normalize_rotation(captures)
-        short_pairs.append(short_pair)
-        groups.append(captures)
+        normalized = captures
+        if hs_normalize:
+            normalized, pair_start = normalize_rotation(
+                captures,
+                expected_pair_start=pair_start,
+                threshold_scale=threshold_scale,
+            )
+        short_pairs.append(pair_start)
+        groups.append(normalized)
     return HardSectorGrouping(
         groups=groups,
         sectors_per_rotation=sectors_per_rotation,
@@ -292,6 +438,10 @@ def group_hard_sectors(
         index_confidence=confidence,
         index_aligned_flag=index_aligned,
         short_pair_positions=short_pairs,
+        pulses_per_rotation=pulses_per_rotation,
+        index_pair_position=short_pair,
+        short_intervals=short_indices,
+        detection_notes=detection_notes,
     )
 
 
@@ -304,38 +454,46 @@ def decode_hole(
     encoding: str = "fm",
     initial_clock_ticks: float | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    invert_bits: bool = False,
+    invert_flux: bool = False,
+    clock_scale: float = 1.0,
 ) -> Optional[SectorGuess]:
     """
     Decode one hole's worth of flux into bytes using FM heuristics or PLL.
     """
-    flux_parts = [track.decode_flux(idx) for idx in hole_capture.revolution_indices]
-    flux: list[int] = []
-    for part in flux_parts:
-        flux.extend(part)
-    if encoding.lower() == "mfm":
-        decoded = decode_mfm_bytes(
-            flux,
-            sample_freq_hz=image.sample_freq_hz,
-            index_ticks=hole_capture.index_ticks,
-            initial_clock_ticks=initial_clock_ticks,
-            clock_adjust=clock_adjust,
-        )
-    elif use_pll:
-        decoded = pll_decode_fm_bytes(
-            flux,
-            sample_freq_hz=image.sample_freq_hz,
-            index_ticks=hole_capture.index_ticks,
-            initial_clock_ticks=initial_clock_ticks,
-            clock_adjust=clock_adjust,
-        )
+    if not use_pll and encoding.lower() == "fm":
+        decoded_bytes = decode_fm_bytes(
+            _flatten_flux(
+                track,
+                hole_capture,
+                invert_flux=invert_flux,
+                clock_scale=clock_scale,
+            )
+        ).bytes_out
+        decoded_score = _score_candidate_bytes(decoded_bytes)
     else:
-        decoded = decode_fm_bytes(flux)
+        decoded = decode_sector_window_bytes(
+            image,
+            track,
+            hole_capture,
+            encoding=encoding,
+            invert_bits=invert_bits,
+            invert_flux=invert_flux,
+            initial_clock_ticks=initial_clock_ticks,
+            clock_adjust=clock_adjust,
+            clock_scale=clock_scale,
+        )
+        decoded_bytes = decoded.bytes_out
+        decoded_score = decoded.score
 
     sync_bytes = (0xA1, 0x4E) if encoding.lower() == "mfm" else (0xA1,)
     sectors = scan_fm_sectors(
-        decoded.bytes_out, require_sync=require_sync, sync_bytes=sync_bytes
+        decoded_bytes, require_sync=require_sync, sync_bytes=sync_bytes
     )
-    return sectors[0] if sectors else None
+    if not sectors:
+        return None
+    sectors[0].decode_score = decoded_score
+    return sectors[0]
 
 
 def compute_flux_index_deltas(
@@ -432,32 +590,34 @@ def decode_hole_bytes(
     encoding: str = "fm",
     initial_clock_ticks: float | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    invert_bits: bool = False,
+    invert_flux: bool = False,
+    clock_scale: float = 1.0,
 ) -> bytes:
     """
     Decode one hole's flux and return raw decoded bytes without sector framing.
     """
-    flux: list[int] = []
-    for idx in hole_capture.revolution_indices:
-        flux.extend(track.decode_flux(idx))
-    if encoding.lower() == "mfm":
-        decoded = decode_mfm_bytes(
-            flux,
-            sample_freq_hz=image.sample_freq_hz,
-            index_ticks=hole_capture.index_ticks,
-            initial_clock_ticks=initial_clock_ticks,
-            clock_adjust=clock_adjust,
+    if not use_pll and encoding.lower() == "fm":
+        flux = _flatten_flux(
+            track,
+            hole_capture,
+            invert_flux=invert_flux,
+            clock_scale=clock_scale,
         )
-        return decoded.bytes_out
-    if use_pll:
-        decoded = pll_decode_fm_bytes(
-            flux,
-            sample_freq_hz=image.sample_freq_hz,
-            index_ticks=hole_capture.index_ticks,
-            initial_clock_ticks=initial_clock_ticks,
-            clock_adjust=clock_adjust,
-        )
-        return decoded.bytes_out
-    return decode_fm_bytes(flux).bytes_out
+        return decode_fm_bytes(flux).bytes_out
+
+    decoded = decode_sector_window_bytes(
+        image,
+        track,
+        hole_capture,
+        encoding=encoding,
+        invert_bits=invert_bits,
+        invert_flux=invert_flux,
+        initial_clock_ticks=initial_clock_ticks,
+        clock_adjust=clock_adjust,
+        clock_scale=clock_scale,
+    )
+    return decoded.bytes_out
 
 
 def assemble_rotation(
@@ -517,6 +677,7 @@ def assemble_rotation(
                 offset, payload, _, _ = windows[0]
             else:
                 offset, payload = 0, raw[:expected_size]
+            decode_score = _score_candidate_bytes(payload)
             guesses.append(
                 SectorGuess(
                     offset=offset,
@@ -529,6 +690,7 @@ def assemble_rotation(
                     id_crc_ok=False,
                     data_crc_ok=False,
                     data=payload,
+                    decode_score=decode_score,
                 )
             )
     return guesses
@@ -546,6 +708,7 @@ def decode_track_best_map(
     calibrate_rotation: bool = False,
     synthetic_from_holes: bool = False,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
+    hs_normalize: bool = True,
 ) -> Dict[int, SectorGuess]:
     track = image.read_track(track_number)
     if not track:
@@ -554,6 +717,7 @@ def decode_track_best_map(
         track,
         sectors_per_rotation=sectors_per_rotation,
         index_aligned=bool(image.header.flags & 0x01),
+        hs_normalize=hs_normalize,
     )
     all_rotations = [
         assemble_rotation(
@@ -625,6 +789,21 @@ def best_sector_map(
             if guess.length != expected_size:
                 continue
             existing = best.get(guess.sector_id)
-            if not existing or (not existing.crc_ok and guess.crc_ok):
+            existing_score = (
+                getattr(existing, "decode_score", None) if existing else None
+            )
+            raw_new_score = getattr(guess, "decode_score", None)
+            new_score = raw_new_score if raw_new_score is not None else -math.inf
+            current_score = existing_score if existing_score is not None else -math.inf
+            choose = (
+                existing is None
+                or (existing is not None and not existing.crc_ok and guess.crc_ok)
+                or (
+                    existing is not None
+                    and existing.crc_ok == guess.crc_ok
+                    and new_score > current_score
+                )
+            )
+            if choose:
                 best[guess.sector_id] = guess
     return {sid: g for sid, g in best.items() if sid < expected_sector_count}
