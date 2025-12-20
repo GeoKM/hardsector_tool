@@ -934,9 +934,9 @@ def reconstruct_track(
             i: [] for i in range(logical_sectors)
         }
         for rot_idx, rotation in enumerate(grouping.groups):
-            assert (
-                len(rotation) == grouping.sectors_per_rotation
-            ), "normalize_rotation must yield merged holes"
+            assert len(rotation) == grouping.sectors_per_rotation, (
+                "normalize_rotation must yield merged holes"
+            )
             shifted = rotation[hole_shift:] + rotation[:hole_shift]
             captures: Sequence[HoleCapture]
             if pair_hole_windows:

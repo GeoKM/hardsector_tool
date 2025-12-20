@@ -1274,7 +1274,9 @@ def main() -> None:
             print("\nWang/OIS HS32 reconstruction:")
             wang_sector_count = args.logical_sectors
             wang_pair_holes = not args.wang_no_pairing
-            wang_clock_factor = args.clock_factor if args.clock_factor is not None else 1.0
+            wang_clock_factor = (
+                args.clock_factor if args.clock_factor is not None else 1.0
+            )
             if args.wang_sector_count is not None:
                 wang_sector_count = args.wang_sector_count
                 if args.wang_sector_count >= args.physical_sectors:
