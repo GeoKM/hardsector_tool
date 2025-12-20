@@ -487,6 +487,7 @@ def pll_decode_bits(
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
     initial_clock_ticks: float | None = None,
     invert: bool = False,
+    clock_factor: float = 2.0,
 ) -> List[int]:
     """
     Decode flux intervals into bitcells using a simple PLL.
@@ -499,7 +500,10 @@ def pll_decode_bits(
         return []
 
     half_med, _, _ = estimate_cell_ticks(flux)
-    clock_ticks = initial_clock_ticks if initial_clock_ticks else half_med * 2
+    if initial_clock_ticks:
+        clock_ticks = initial_clock_ticks
+    else:
+        clock_ticks = max(1, int(round(half_med * clock_factor)))
     clock = clock_ticks / sample_freq_hz
     clock_min = clock * (1 - clock_adjust)
     clock_max = clock * (1 + clock_adjust)
@@ -531,7 +535,7 @@ def pll_decode_bits(
         if zeros <= 3:
             clock += ticks * PLL_PERIOD_ADJ
         else:
-            clock += ((half_med * 2) / sample_freq_hz - clock) * PLL_PERIOD_ADJ
+            clock += ((half_med * clock_factor) / sample_freq_hz - clock) * PLL_PERIOD_ADJ
         clock = min(max(clock, clock_min), clock_max)
         new_ticks = ticks * (1 - PLL_PHASE_ADJ)
         ticks = new_ticks
@@ -546,6 +550,7 @@ def pll_decode_fm_bytes(
     initial_clock_ticks: float | None = None,
     clock_adjust: float = DEFAULT_CLOCK_ADJ,
     invert: bool = False,
+    clock_factor: float = 2.0,
 ) -> PLLDecodeResult:
     """
     Decode FM by PLL to bitcells, then map clock/data phases into bytes.
@@ -558,11 +563,14 @@ def pll_decode_fm_bytes(
         initial_clock_ticks=initial_clock_ticks,
         clock_adjust=clock_adjust,
         invert=invert,
+        clock_factor=clock_factor,
     )
     best_phase, candidates = _select_fm_phase_candidates(bitcells)
     decoded = best_phase.bytes_out
     half_med, _, _ = estimate_cell_ticks(flux)
-    clock_ticks = initial_clock_ticks if initial_clock_ticks else half_med * 2
+    clock_ticks = (
+        initial_clock_ticks if initial_clock_ticks else half_med * clock_factor
+    )
     return PLLDecodeResult(
         bytes_out=decoded,
         bit_shift=best_phase.bit_shift,

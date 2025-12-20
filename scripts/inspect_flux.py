@@ -211,6 +211,15 @@ def main() -> None:
         help="Scale estimated clock ticks (e.g., 0.5 or 2.0) before PLL.",
     )
     parser.add_argument(
+        "--clock-factor",
+        type=float,
+        default=None,
+        help=(
+            "PLL clock multiplier applied to the estimated half-cell duration. "
+            "For Greaseweazle hard-sector RAW FM captures try 1.0 (default is 2.0)."
+        ),
+    )
+    parser.add_argument(
         "--synthetic-from-holes",
         action="store_true",
         help="If no IDAMs are found, synthesize sectors from hole payloads (mod expected sector count).",
@@ -634,6 +643,7 @@ def main() -> None:
             print(f"\nFM decode skipped: hole {rev_index} beyond available revolutions")
             return
         flux = track.decode_flux(rev_index)
+        clock_factor = args.clock_factor if args.clock_factor is not None else 2.0
         if args.encoding == "mfm":
             result = decode_mfm_bytes(
                 flux,
@@ -646,6 +656,7 @@ def main() -> None:
                 flux,
                 sample_freq_hz=image.sample_freq_hz,
                 index_ticks=track.revolutions[rev_index].index_ticks,
+                clock_factor=clock_factor,
             )
             meta = f"pll clock ~{result.initial_clock_ticks:.1f} ticks"
         else:
@@ -1263,6 +1274,7 @@ def main() -> None:
             print("\nWang/OIS HS32 reconstruction:")
             wang_sector_count = args.logical_sectors
             wang_pair_holes = not args.wang_no_pairing
+            wang_clock_factor = args.clock_factor if args.clock_factor is not None else 1.0
             if args.wang_sector_count is not None:
                 wang_sector_count = args.wang_sector_count
                 if args.wang_sector_count >= args.physical_sectors:
@@ -1287,6 +1299,8 @@ def main() -> None:
                         pair_hole_windows=wang_pair_holes,
                         clock_adjust=args.clock_adjust,
                         dump_raw=args.dump_wang_raw,
+                        clock_factor=wang_clock_factor,
+                        clock_scale=args.clock_scale,
                     )
                     if score > best_score or (
                         score == best_score and len(wang_map) > best_len

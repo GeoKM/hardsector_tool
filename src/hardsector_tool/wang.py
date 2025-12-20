@@ -400,6 +400,7 @@ def _decode_capture(
     clock_adjust: float = 0.10,
     invert: bool = False,
     clock_scale: float = 1.0,
+    clock_factor: float | None = None,
 ) -> DecodedStream:
     flux: list[int] = []
     for idx in capture.revolution_indices:
@@ -414,6 +415,7 @@ def _decode_capture(
             index_ticks=capture.index_ticks,
             clock_adjust=clock_adjust,
             invert=invert,
+            clock_factor=clock_factor if clock_factor is not None else 2.0,
         )
         candidates = result.phase_candidates or ()
         candidate_map = {cand.phase: cand for cand in candidates}
@@ -845,6 +847,7 @@ def reconstruct_track(
     hole_shifts: Sequence[int] | None = None,
     invert: bool = False,
     clock_scale: float = 1.0,
+    clock_factor: float = 1.0,
 ) -> tuple[Dict[int, WangSector], dict[int, SectorReconstruction], float]:
     track = image.read_track(track_number)
     if not track:
@@ -861,10 +864,18 @@ def reconstruct_track(
     shift_candidates = list(
         dict.fromkeys(hole_shifts or range(grouping.sectors_per_rotation))
     )
-    decoded_cache: dict[tuple[int, tuple[int, ...], float, bool], DecodedStream] = {}
+    decoded_cache: dict[
+        tuple[int, tuple[int, ...], float, bool, float], DecodedStream
+    ] = {}
 
     def decode_pair(rotation_index: int, pair: HoleCapture) -> DecodedStream:
-        key = (rotation_index, tuple(pair.revolution_indices), clock_scale, invert)
+        key = (
+            rotation_index,
+            tuple(pair.revolution_indices),
+            clock_scale,
+            invert,
+            clock_factor,
+        )
         if key not in decoded_cache:
             decoded_cache[key] = _decode_capture(
                 image,
@@ -874,6 +885,7 @@ def reconstruct_track(
                 clock_adjust=clock_adjust,
                 invert=invert,
                 clock_scale=clock_scale,
+                clock_factor=clock_factor,
             )
         return decoded_cache[key]
 
