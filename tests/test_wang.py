@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from hardsector_tool.hardsector import group_hard_sectors, pair_holes
 from hardsector_tool.scp import SCPImage
 from hardsector_tool.wang import reconstruct_track, scan_wang_frames
@@ -72,4 +74,38 @@ def test_reconstruct_track_supports_unpaired_sectors() -> None:
     assert reconstructed == {} or (
         max(s.sector_id for s in reconstructed.values()) < 32
         and len(reconstructed) <= 32
+    )
+
+
+def test_reconstruct_track_promotes_dominant_transform_family() -> None:
+    if not FIXTURE_221.exists():
+        pytest.skip("ACMS80221 fixture missing")
+
+    image = SCPImage.from_file(FIXTURE_221)
+    reconstructed, _, _ = reconstruct_track(
+        image,
+        0,
+        sector_size=256,
+        logical_sectors=16,
+        pair_phase=0,
+        clock_factor=1.0,
+    )
+
+    assert len(reconstructed) == 16
+
+    prefix_counts: dict[str, int] = {}
+    for sector in reconstructed.values():
+        for alg in sector.checksum_algorithms:
+            prefix = alg.split(":", 1)[0]
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+
+    assert prefix_counts
+    dominant_prefix = max(prefix_counts.items(), key=lambda item: item[1])[0]
+    assert prefix_counts[dominant_prefix] >= 15
+
+    sector_six = reconstructed.get(6)
+    assert sector_six is not None
+    assert sector_six.checksum_algorithms
+    assert any(
+        alg.startswith(dominant_prefix) for alg in sector_six.checksum_algorithms
     )
