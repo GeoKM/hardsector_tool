@@ -934,9 +934,9 @@ def reconstruct_track(
             i: [] for i in range(logical_sectors)
         }
         for rot_idx, rotation in enumerate(grouping.groups):
-            assert (
-                len(rotation) == grouping.sectors_per_rotation
-            ), "normalize_rotation must yield merged holes"
+            assert len(rotation) == grouping.sectors_per_rotation, (
+                "normalize_rotation must yield merged holes"
+            )
             shifted = rotation[hole_shift:] + rotation[:hole_shift]
             captures: Sequence[HoleCapture]
             if pair_hole_windows:
@@ -1006,6 +1006,159 @@ def reconstruct_track(
 
     if best_results is None or best_recon is None or best_streams is None:
         return {}, {}, 0.0
+
+    def _algorithm_prefix(algorithm: str) -> str:
+        return algorithm.split(":", 1)[0]
+
+    algorithm_counts: Counter[str] = Counter()
+    prefix_counts: Counter[str] = Counter()
+    for sector in best_results.values():
+        for alg in sector.checksum_algorithms:
+            algorithm_counts[alg] += 1
+            prefix_counts[_algorithm_prefix(alg)] += 1
+
+    dominant_prefix: str | None = None
+    dominant_algorithms: tuple[str, ...] = ()
+    if prefix_counts:
+        dominant_prefix, dominant_prefix_count = prefix_counts.most_common(1)[0]
+        confident_threshold = max(10, math.ceil(0.8 * len(best_results)))
+        if dominant_prefix_count < confident_threshold:
+            dominant_prefix = None
+        else:
+            algs_in_prefix = {
+                alg: count
+                for alg, count in algorithm_counts.items()
+                if _algorithm_prefix(alg) == dominant_prefix
+            }
+            if algs_in_prefix:
+                max_count = max(algs_in_prefix.values())
+                dominant_algorithms = tuple(
+                    sorted(
+                        alg
+                        for alg, count in algs_in_prefix.items()
+                        if count == max_count
+                    )
+                )
+
+    def _transform_checksum_algorithms(result: TransformResult) -> tuple[str, ...]:
+        if not result.checksum_hits:
+            return ()
+        prefix = f"p{result.phase}_inv{int(result.invert)}_br{int(result.bit_reverse)}"
+        return tuple({f"{prefix}:{hit.algorithm}" for hit in result.checksum_hits})
+
+    def _transform_base_score(result: TransformResult) -> float:
+        return len(result.checksum_hits) * 10 - result.fill_ratio * 5.0 + result.entropy
+
+    def _composite_score(
+        result: TransformResult,
+    ) -> tuple[float, dict[str, float | int | bool]]:
+        algorithms = _transform_checksum_algorithms(result)
+        base_score = _transform_base_score(result)
+        has_checksum = bool(algorithms)
+        score = base_score
+        overlap = 0
+        prefix_match = False
+        if dominant_prefix:
+            prefix_match = any(
+                _algorithm_prefix(alg) == dominant_prefix for alg in algorithms
+            )
+            if prefix_match:
+                score += 100
+            elif has_checksum:
+                score -= 20
+            overlap = sum(1 for alg in algorithms if alg in dominant_algorithms)
+            score += min(80, overlap * 10)
+        if has_checksum:
+            score += 5
+        else:
+            score -= 50
+        return score, {
+            "base": base_score,
+            "has_checksum": has_checksum,
+            "prefix_match": prefix_match,
+            "overlap": overlap,
+            "algorithms": algorithms,
+        }
+
+    if dominant_prefix:
+        print(
+            "  Dominant transform family:",
+            dominant_prefix,
+            "algorithms=",
+            ", ".join(dominant_algorithms) if dominant_algorithms else "(none)",
+        )
+
+    for sid, reconstruction in list(best_recon.items()):
+        current_algorithms = reconstruction.wang_sector.checksum_algorithms
+        outlier = not current_algorithms or not any(
+            _algorithm_prefix(alg) == dominant_prefix for alg in current_algorithms
+        )
+        if not dominant_prefix or not outlier:
+            continue
+
+        candidate_recons = [reconstruction]
+        for stream in best_streams.get(sid, []):
+            alt_sector, alt_recon = _reconstruct_sector(
+                [stream],
+                track_number=track_number,
+                sector_id=sid,
+                sector_size=best_size,
+                similarity_threshold=similarity_threshold,
+                keep_best=keep_best,
+                hole_shift=best_shift,
+            )
+            if alt_sector and alt_recon:
+                candidate_recons.append(alt_recon)
+
+        best_choice: (
+            tuple[SectorReconstruction, TransformResult, dict[str, float | int | bool]]
+            | None
+        ) = None
+        best_score = -math.inf
+        for recon_option in candidate_recons:
+            for candidate in recon_option.transform_results:
+                score, meta = _composite_score(candidate)
+                if score > best_score:
+                    best_choice = (recon_option, candidate, meta)
+                    best_score = score
+
+        if best_choice is None:
+            continue
+
+        chosen_recon, best_candidate, best_meta = best_choice
+        candidate_algorithms = tuple(best_meta.get("algorithms", ()))
+        if not candidate_algorithms:
+            continue
+
+        new_payload = best_candidate.payload
+        new_entropy = _window_entropy(new_payload)
+        new_fill = _fill_ratio_ff00(new_payload)
+        new_gap = _is_gap_payload(new_fill, new_entropy)
+        best_sector = WangSector(
+            track=chosen_recon.wang_sector.track,
+            sector_id=chosen_recon.wang_sector.sector_id,
+            offset=chosen_recon.payload_offset,
+            payload=new_payload,
+            checksum=b"",
+            checksum_algorithms=candidate_algorithms,
+        )
+        print(
+            "   Re-ranked sector",
+            sid,
+            "from",
+            ",".join(current_algorithms) if current_algorithms else "(none)",
+            "to",
+            ",".join(candidate_algorithms) if candidate_algorithms else "(none)",
+            f"score={best_score:.2f}",
+        )
+        chosen_recon.wang_sector = best_sector
+        chosen_recon.best_transform = best_candidate
+        chosen_recon.payload_entropy = new_entropy
+        chosen_recon.payload_fill_ratio = new_fill
+        chosen_recon.payload_gap = new_gap
+        chosen_recon.chosen_fm_phase = best_candidate.phase
+        best_results[sid] = best_sector
+        best_recon[sid] = chosen_recon
 
     all_streams = [stream for streams in best_streams.values() for stream in streams]
     phase_buckets: dict[int, list[FMPhaseCandidate]] = {0: [], 1: []}

@@ -535,7 +535,9 @@ def pll_decode_bits(
         if zeros <= 3:
             clock += ticks * PLL_PERIOD_ADJ
         else:
-            clock += ((half_med * clock_factor) / sample_freq_hz - clock) * PLL_PERIOD_ADJ
+            clock += (
+                (half_med * clock_factor) / sample_freq_hz - clock
+            ) * PLL_PERIOD_ADJ
         clock = min(max(clock, clock_min), clock_max)
         new_ticks = ticks * (1 - PLL_PHASE_ADJ)
         ticks = new_ticks
