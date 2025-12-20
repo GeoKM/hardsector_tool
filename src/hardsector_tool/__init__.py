@@ -5,6 +5,7 @@ This package will collect parsers, analyzers, and CLI helpers for working with
 hard-sectored floppy disk flux captures such as the ACMS80217 sample set.
 """
 
+from .diskdump import DiskReconstructor, ReconstructionResult
 from .fm import (
     FMDecodeResult,
     MFMDecodeResult,
@@ -78,6 +79,8 @@ __all__ = [
     "stitch_rotation_flux",
     "reconstruct_track",
     "summarize_wang_map",
+    "DiskReconstructor",
+    "ReconstructionResult",
 ]
 
 __version__ = "0.0.1"
