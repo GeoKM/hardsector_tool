@@ -44,12 +44,16 @@ def _load_manifest(out_dir: Path) -> dict:
     return json.loads(manifest_path.read_text())
 
 
-def _load_sector(track: int, sector: int, out_dir: Path, sector_size: int) -> SectorData | None:
+def _load_sector(
+    track: int, sector: int, out_dir: Path, sector_size: int
+) -> SectorData | None:
     path = out_dir / "sectors" / f"T{track:02d}_S{sector:02d}.bin"
     if not path.exists():
         return None
     payload = path.read_bytes()
-    return SectorData(track=track, sector=sector, payload=payload, sector_size=sector_size)
+    return SectorData(
+        track=track, sector=sector, payload=payload, sector_size=sector_size
+    )
 
 
 def _sector_size_for_track(track: int, out_dir: Path, default: int) -> int:
@@ -121,13 +125,17 @@ def _pointer_counts(payload: bytes) -> dict[str, int]:
     }
 
 
-def _name_tokens(payload: bytes) -> tuple[list[tuple[int, bytes]], list[tuple[int, bytes]]]:
+def _name_tokens(
+    payload: bytes,
+) -> tuple[list[tuple[int, bytes]], list[tuple[int, bytes]]]:
     names = [(m.start(), m.group(0)) for m in NAME_EXT_RE.finditer(payload)]
     uppercase = [(m.start(), m.group(0)) for m in UPPER_TOKEN_RE.finditer(payload)]
     return names, uppercase
 
 
-def _signature_hits(payload: bytes, track: int, sector: int, limit: int = 200) -> list[dict]:
+def _signature_hits(
+    payload: bytes, track: int, sector: int, limit: int = 200
+) -> list[dict]:
     hits: list[dict] = []
     for token in SIGNATURE_STRINGS:
         start = 0
@@ -214,14 +222,18 @@ def _record_scores(payload: bytes) -> list[dict]:
     return results[:3]
 
 
-def _directory_score(name_density: int, pointer_score: int, record_score: float) -> float:
+def _directory_score(
+    name_density: int, pointer_score: int, record_score: float
+) -> float:
     return record_score * 3 + name_density * 0.5 + pointer_score * 0.25
 
 
 def scan_metadata(out_dir: Path) -> dict:
     manifest = _load_manifest(out_dir)
     track_entries = manifest.get("tracks", [])
-    expected_tracks = [entry.get("track_number", entry.get("logical_track")) for entry in track_entries]
+    expected_tracks = [
+        entry.get("track_number", entry.get("logical_track")) for entry in track_entries
+    ]
     expected_tracks = [t for t in expected_tracks if t is not None]
     if not expected_tracks:
         expected_tracks = list(range(77))
@@ -253,7 +265,9 @@ def scan_metadata(out_dir: Path) -> dict:
     pointer_details: dict[str, dict] = {}
 
     for sector in sectors:
-        signature_hits.extend(_signature_hits(sector.payload, sector.track, sector.sector))
+        signature_hits.extend(
+            _signature_hits(sector.payload, sector.track, sector.sector)
+        )
 
         names, upper = _name_tokens(sector.payload)
         name_count = len({n for _, n in names})
@@ -269,17 +283,21 @@ def scan_metadata(out_dir: Path) -> dict:
 
         record_scores = _record_scores(sector.payload)
         if record_scores:
-            record_candidates[f"T{sector.track:02d}_S{sector.sector:02d}"] = record_scores
+            record_candidates[f"T{sector.track:02d}_S{sector.sector:02d}"] = (
+                record_scores
+            )
 
         ptr_counts = _pointer_counts(sector.payload)
         entropy = _entropy(sector.payload)
         fill_ratio = sum(1 for b in sector.payload if b in (0x00, 0xFF)) / max(
             1, len(sector.payload)
         )
-        ptr_counts.update({
-            "entropy": entropy,
-            "fill00ff_ratio": fill_ratio,
-        })
+        ptr_counts.update(
+            {
+                "entropy": entropy,
+                "fill00ff_ratio": fill_ratio,
+            }
+        )
         pointer_details[f"T{sector.track:02d}_S{sector.sector:02d}"] = ptr_counts
 
     name_sorted = sorted(
@@ -300,7 +318,9 @@ def scan_metadata(out_dir: Path) -> dict:
             )[:20],
             "linear16": sorted(
                 pointer_details.items(),
-                key=lambda kv: -(kv[1]["linear16_le_count"] + kv[1]["linear16_be_count"]),
+                key=lambda kv: -(
+                    kv[1]["linear16_le_count"] + kv[1]["linear16_be_count"]
+                ),
             )[:20],
         },
     }
@@ -377,7 +397,9 @@ def scan_metadata(out_dir: Path) -> dict:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scan reconstructed sectors for metadata")
+    parser = argparse.ArgumentParser(
+        description="Scan reconstructed sectors for metadata"
+    )
     parser.add_argument("out_dir", type=Path, help="Reconstruction output directory")
     parser.add_argument("--out", required=True, type=Path, help="Output JSON path")
     return parser

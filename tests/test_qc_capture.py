@@ -28,7 +28,9 @@ def test_qc_outdir_missing_sector(tmp_path: Path) -> None:
         if track == 0:
             track_meta["sectors"] = [{"sector_id": 0}, {"sector_id": 1}]
             for sector in [0, 1]:
-                sectors_dir.joinpath(f"T{track:02d}_S{sector:02d}.bin").write_bytes(b"data")
+                sectors_dir.joinpath(f"T{track:02d}_S{sector:02d}.bin").write_bytes(
+                    b"data"
+                )
         else:
             track_meta["sectors"] = [{"sector_id": 0}]
             sectors_dir.joinpath(f"T{track:02d}_S00.bin").write_bytes(b"data")
@@ -57,9 +59,13 @@ def test_qc_outdir_crc_only_warning(tmp_path: Path) -> None:
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
 
     tracks_dir.joinpath("T00.json").write_text(
-        json.dumps({"sectors": [{"sector_id": 0, "status": "CRC_FAIL"}, {"sector_id": 1}]})
+        json.dumps(
+            {"sectors": [{"sector_id": 0, "status": "CRC_FAIL"}, {"sector_id": 1}]}
+        )
     )
-    tracks_dir.joinpath("T01.json").write_text(json.dumps({"sectors": [{"sector_id": 0}, {"sector_id": 1}]}))
+    tracks_dir.joinpath("T01.json").write_text(
+        json.dumps({"sectors": [{"sector_id": 0}, {"sector_id": 1}]})
+    )
 
     for track in [0, 1]:
         for sector in [0, 1]:

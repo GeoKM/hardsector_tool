@@ -627,7 +627,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     qc.add_argument("--out", type=Path, help="Optional JSON output path")
     qc.add_argument("--tracks", default="0-76", help="Track range for SCP inputs")
-    qc.add_argument("--side", type=int, default=0, help="Head/side index for SCP inputs")
+    qc.add_argument(
+        "--side", type=int, default=0, help="Head/side index for SCP inputs"
+    )
     qc.add_argument(
         "--track-step",
         choices=["auto", "1", "2"],
@@ -640,7 +642,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Hard-sector holes per rotation (SCP QC only)",
     )
-    qc.add_argument("--revs", type=int, default=None, help="Expected revolutions for capture")
+    qc.add_argument(
+        "--revs", type=int, default=None, help="Expected revolutions for capture"
+    )
     qc.add_argument(
         "--fail-thresholds",
         default="conservative",

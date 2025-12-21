@@ -29,7 +29,9 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
                 "sector_size": 256,
             }
         )
-        tracks_dir.joinpath(f"T{track:02d}.json").write_text(json.dumps({"sector_size": 256}))
+        tracks_dir.joinpath(f"T{track:02d}.json").write_text(
+            json.dumps({"sector_size": 256})
+        )
         for sector in range(16):
             content = bytearray(b"\x00" * 256)
             if track == 0 and sector == 0:

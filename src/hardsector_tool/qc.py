@@ -97,11 +97,17 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
     for track_entry in manifest.get("tracks", []):
         track_number = int(track_entry.get("track_number") or 0)
         track_meta_path = tracks_dir / f"T{track_number:02d}.json"
-        track_meta = json.loads(track_meta_path.read_text()) if track_meta_path.exists() else {}
+        track_meta = (
+            json.loads(track_meta_path.read_text()) if track_meta_path.exists() else {}
+        )
         sectors_present_ids = [
-            int(s.get("sector_id")) for s in track_meta.get("sectors", []) if "sector_id" in s
+            int(s.get("sector_id"))
+            for s in track_meta.get("sectors", [])
+            if "sector_id" in s
         ]
-        recovered = int(track_entry.get("recovered_sectors") or len(sectors_present_ids))
+        recovered = int(
+            track_entry.get("recovered_sectors") or len(sectors_present_ids)
+        )
         expected = expected_per_track or recovered
         crc_fail, no_decode, low_conf = _collect_track_issue_counts(track_meta)
 
@@ -127,7 +133,9 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
         }
 
         if expected_per_track is not None:
-            missing_ids = [i for i in range(expected_per_track) if i not in sectors_present_ids]
+            missing_ids = [
+                i for i in range(expected_per_track) if i not in sectors_present_ids
+            ]
             entry["missing_sectors"] = missing_ids
         per_track_entries.append(entry)
         crc_like_total += crc_fail
@@ -157,7 +165,9 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
 
     if no_decode_total > 0:
         overall_status = _worse_status(overall_status, "WARN")
-        reasons.append("Un-decodable sectors present; capture/decoding limits suspected")
+        reasons.append(
+            "Un-decodable sectors present; capture/decoding limits suspected"
+        )
         suggestions.append("inspect flux or adjust reconstruction parameters")
 
     classification = "unknown"
@@ -244,12 +254,14 @@ def qc_from_scp(
 
     for logical_track in tracks:
         try:
-            scp_track_id, mapping_mode, step, used_fallback, expected_track_id = map_logical_to_scp_track_id(
-                image,
-                logical_track,
-                side=side,
-                track_step=track_step,
-                present_tracks=present_tracks,
+            scp_track_id, mapping_mode, step, used_fallback, expected_track_id = (
+                map_logical_to_scp_track_id(
+                    image,
+                    logical_track,
+                    side=side,
+                    track_step=track_step,
+                    present_tracks=present_tracks,
+                )
             )
         except ValueError as exc:
             missing_tracks.append(logical_track)
@@ -314,7 +326,9 @@ def qc_from_scp(
                 )
         if timing.get("cv") is not None and timing["cv"] > 0.20:
             overall_status = _worse_status(overall_status, "WARN")
-            reasons.append(f"Track {logical_track} shows high revolution jitter (cv={timing['cv']:.2f})")
+            reasons.append(
+                f"Track {logical_track} shows high revolution jitter (cv={timing['cv']:.2f})"
+            )
         if anomalies["dropouts"] or anomalies["noise"]:
             overall_status = _worse_status(overall_status, "WARN")
             reasons.append(
