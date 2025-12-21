@@ -610,6 +610,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     scan.add_argument("out_dir", type=Path, help="Reconstruction output directory")
     scan.add_argument("--out", required=True, type=Path, help="Output JSON path")
 
+    from . import extractmods
+
+    extractmods.build_arg_parser(subparsers)
+
     return parser
 
 
@@ -645,6 +649,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         result = scanmeta.scan_metadata(args.out_dir)
         args.out.write_text(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "extract-modules":
+        from . import extractmods
+
+        hypotheses = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
+        extractmods.extract_modules(
+            args.out_dir,
+            args.out,
+            min_refs=args.min_refs,
+            max_refs=args.max_refs,
+            hypotheses=hypotheses,
+            only_prefix=args.only_prefix,
+            dry_run=args.dry_run,
+            force=args.force,
+        )
         return 0
 
     parser.error(f"Unknown command {args.command}")
