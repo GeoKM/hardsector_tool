@@ -430,6 +430,7 @@ def extract_modules(
     hypotheses: Iterable[str] = ("H1", "H2", "H3", "H4"),
     enable_pppp_descriptors: bool = True,
     pppp_span_sectors: int = 1,
+    require_name_in_pppp_list: bool = False,
     only_prefix: str | None = None,
     only_prefix_norm: str | None = None,
     dry_run: bool = False,
@@ -482,6 +483,7 @@ def extract_modules(
     bytes_written_total = 0
     unparsed_descriptors: list[dict] = []
     unparsed_pppp_descriptors: list[dict] = []
+    descriptor_records_filtered: list[dict] = []
     pppp_descriptor_skipped = 0
 
     name_list_modules: dict[str, dict] = {}
@@ -496,6 +498,8 @@ def extract_modules(
 
     name_list_hits_found = len(pppp_entries)
     unique_name_list_modules = len(name_list_modules)
+    pppp_name_set = {entry["module_name"].upper() for entry in pppp_entries}
+    descriptor_records_filtered_by_pppp = 0
 
     for name, track, sector, eq_offset, after_offset in descriptors:
         name_upper = name.upper()
@@ -503,6 +507,21 @@ def extract_modules(
             name_upper.startswith(prefix_norm_upper)
             or (prefix_raw_upper and name_upper.startswith(prefix_raw_upper))
         ):
+            continue
+
+        if require_name_in_pppp_list and name_upper not in pppp_name_set:
+            descriptor_records_filtered_by_pppp += 1
+            if len(descriptor_records_filtered) < 50:
+                descriptor_records_filtered.append(
+                    {
+                        "module_name": name,
+                        "found_at": {
+                            "track": track,
+                            "sector": sector,
+                            "offset": eq_offset,
+                        },
+                    }
+                )
             continue
         payload = sector_db.get((track, sector), b"")
         pointer_bytes, pointer_window = _descriptor_pointer_window(
@@ -701,6 +720,7 @@ def extract_modules(
             "descriptor_records_parsed": parsed_descriptors,
             "extracted_modules": extracted_modules,
             "descriptor_records_skipped": skipped_descriptors,
+            "descriptor_records_filtered_by_pppp": descriptor_records_filtered_by_pppp,
             "name_list_hits_found": name_list_hits_found,
             "unique_name_list_modules": unique_name_list_modules,
             "pppp_descriptor_found": pppp_descriptor_found,
@@ -712,6 +732,7 @@ def extract_modules(
         "by_hypothesis": per_hypothesis,
         "name_list_modules": name_list_modules_list,
         "descriptor_records_unparsed": unparsed_descriptors,
+        "descriptor_records_filtered": descriptor_records_filtered,
         "pppp_descriptor_records_unparsed": unparsed_pppp_descriptors,
         "geometry": {
             "tracks": len(geometry.tracks),
@@ -726,7 +747,7 @@ def extract_modules(
     print(
         "Descriptors: "
         f"found {descriptors_found}, parsed {parsed_descriptors}, extracted {extracted_modules}, "
-        f"skipped {skipped_descriptors}; "
+        f"skipped {skipped_descriptors}, filtered_by_pppp {descriptor_records_filtered_by_pppp}; "
         f"Name-lists: hits {name_list_hits_found}, unique modules {unique_name_list_modules}; "
         f"pppp descriptors: found {pppp_descriptor_found}, parsed {pppp_descriptor_parsed}, "
         f"skipped {pppp_descriptor_skipped}; "
@@ -774,6 +795,11 @@ def build_arg_parser(
         help="Allow including bytes from the next sector when decoding pppp pointers",
     )
     parser.add_argument(
+        "--require-name-in-pppp-list",
+        action="store_true",
+        help="Only decode descriptors whose names also appear in the pppp name list",
+    )
+    parser.add_argument(
         "--only-prefix", help="Only extract descriptors with this name prefix"
     )
     parser.add_argument(
@@ -804,6 +830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hypotheses=hypotheses,
             enable_pppp_descriptors=args.enable_pppp_descriptors,
             pppp_span_sectors=max(0, args.pppp_span_sectors),
+            require_name_in_pppp_list=args.require_name_in_pppp_list,
             only_prefix=only_prefix,
             only_prefix_norm=prefix_norm,
             dry_run=args.dry_run,
