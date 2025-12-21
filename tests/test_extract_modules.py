@@ -43,7 +43,76 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
     return out_dir
 
 
-def _run_extract_cli(out_dir: Path, derived_dir: Path, only_prefix: str) -> dict:
+def _build_pppp_descriptor_fixture(tmp_path: Path) -> Path:
+    out_dir = tmp_path / "reconstruct_pppp"
+    sectors_dir = out_dir / "sectors"
+    tracks_dir = out_dir / "tracks"
+    sectors_dir.mkdir(parents=True, exist_ok=True)
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "tracks": [{"track_number": 0, "recovered_sectors": 16, "sector_size": 256}],
+        "totals": {"expected_sectors": 16, "written_sectors": 5, "missing_sectors": 11},
+    }
+
+    pointer_list = b"\x00\x00\x01\x00\x02\x00"
+    pppp_entry = b"pppp=CONTROL.AT////" + pointer_list + b"pppp=SECOND.NAME"
+
+    for sector in range(5):
+        content = bytearray(bytes([sector]) * 256)
+        if sector == 0:
+            descriptor = b"=SYSGEN.TEST////" + pointer_list + b"\x00\x00"
+            content[: len(descriptor)] = descriptor
+        elif sector == 1:
+            content[: len(pppp_entry)] = pppp_entry
+        sectors_dir.joinpath(f"T00_S{sector:02d}.bin").write_bytes(content)
+
+    tracks_dir.joinpath("T00.json").write_text(json.dumps({"sector_size": 256}))
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    return out_dir
+
+
+def _build_pppp_span_fixture(tmp_path: Path) -> Path:
+    out_dir = tmp_path / "reconstruct_pppp_span"
+    sectors_dir = out_dir / "sectors"
+    tracks_dir = out_dir / "tracks"
+    sectors_dir.mkdir(parents=True, exist_ok=True)
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "tracks": [{"track_number": 0, "recovered_sectors": 16, "sector_size": 256}],
+        "totals": {"expected_sectors": 16, "written_sectors": 6, "missing_sectors": 10},
+    }
+
+    for sector in range(6):
+        content = bytearray(bytes([sector]) * 256)
+        if sector == 0:
+            descriptor = b"=SYSGEN.TEST////" + b"\x00\x00\x01\x00\x02\x00" + b"\x00\x00"
+            content[: len(descriptor)] = descriptor
+        elif sector == 2:
+            entry = b"pppp=CONTROL.QUEUE////"
+            start_offset = 256 - len(entry)
+            content[start_offset : start_offset + len(entry)] = entry
+        elif sector == 3:
+            pointer_bytes = b"\x00\x00\x01\x00\x04\x00"
+            next_marker = b"pppp=TAIL.END"
+            content[: len(pointer_bytes)] = pointer_bytes
+            content[len(pointer_bytes) : len(pointer_bytes) + len(next_marker)] = (
+                next_marker
+            )
+        sectors_dir.joinpath(f"T00_S{sector:02d}.bin").write_bytes(content)
+
+    tracks_dir.joinpath("T00.json").write_text(json.dumps({"sector_size": 256}))
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    return out_dir
+
+
+def _run_extract_cli(
+    out_dir: Path,
+    derived_dir: Path,
+    only_prefix: str,
+    extra_args: list[str] | None = None,
+) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
 
@@ -60,6 +129,8 @@ def _run_extract_cli(out_dir: Path, derived_dir: Path, only_prefix: str) -> dict
         "--only-prefix",
         only_prefix,
     ]
+    if extra_args:
+        cmd.extend(extra_args)
 
     result = subprocess.run(cmd, check=False, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -100,11 +171,17 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
     assert totals["descriptor_records_skipped"] == 0
     assert totals["name_list_hits_found"] == 1
     assert totals["unique_name_list_modules"] == 1
+    assert totals["pppp_descriptor_found"] == 0
+    assert totals["pppp_descriptor_parsed"] == 0
+    assert totals["pppp_descriptor_skipped"] == 0
 
-    assert summary["by_hypothesis"]["H1_le16"] == 1
-    assert summary["by_hypothesis"]["unparsed_descriptor"] == 0
+    descriptor_hypotheses = summary["by_hypothesis"]["descriptor"]
+    assert descriptor_hypotheses["H1_le16"] == 1
+    assert descriptor_hypotheses["unparsed_descriptor"] == 0
 
-    name_list_modules = {entry["module_name"]: entry for entry in summary["name_list_modules"]}
+    name_list_modules = {
+        entry["module_name"]: entry for entry in summary["name_list_modules"]
+    }
     assert name_list_modules["DOS.MENU"]["count"] == 1
     assert name_list_modules["DOS.MENU"]["sample_locations"][0]["sector"] == 1
 
@@ -135,6 +212,56 @@ def test_only_prefix_normalization(tmp_path: Path) -> None:
     assert totals["missing_ref_modules"] == 0
     assert totals["bytes_written_total"] > 0
 
-    by_hypothesis = summary_with_equals["by_hypothesis"]
+    by_hypothesis = summary_with_equals["by_hypothesis"]["descriptor"]
     assert by_hypothesis["H1_le16"] == 1
     assert by_hypothesis["unparsed_descriptor"] == 0
+
+
+def test_pppp_descriptor_upgrade(tmp_path: Path) -> None:
+    out_dir = _build_pppp_descriptor_fixture(tmp_path)
+    derived_dir = tmp_path / "derived_pppp"
+    summary = _run_extract_cli(out_dir, derived_dir, "CONTROL.")
+
+    module_path = derived_dir / "CONTROL.AT.bin"
+    assert module_path.exists()
+    assert module_path.stat().st_size == 3 * 256
+
+    totals = summary["totals"]
+    assert totals["descriptor_records_found"] == 1
+    assert totals["descriptor_records_parsed"] == 0
+    assert totals["descriptor_records_skipped"] == 1
+    assert totals["pppp_descriptor_found"] == 1
+    assert totals["pppp_descriptor_parsed"] == 1
+    assert totals["pppp_descriptor_skipped"] == 0
+
+    pppp_hypotheses = summary["by_hypothesis"]["pppp_descriptor"]
+    assert pppp_hypotheses["H1_le16"] == 1
+    assert pppp_hypotheses["unparsed_descriptor"] == 0
+
+    modules = {mod["module_name"]: mod for mod in summary["modules"]}
+    control_sidecar = modules["CONTROL.AT"]
+    assert control_sidecar["record_type"] == "pppp_descriptor"
+    assert control_sidecar["pointer_window"]["span_sectors_used"] == 0
+
+
+def test_pppp_descriptor_span(tmp_path: Path) -> None:
+    out_dir = _build_pppp_span_fixture(tmp_path)
+    derived_dir = tmp_path / "derived_pppp_span"
+    summary = _run_extract_cli(
+        out_dir, derived_dir, "CONTROL.", extra_args=["--pppp-span-sectors", "1"]
+    )
+
+    module_path = derived_dir / "CONTROL.QUEUE.bin"
+    assert module_path.exists()
+    assert module_path.stat().st_size == 3 * 256
+
+    control_sidecar = json.loads((derived_dir / "CONTROL.QUEUE.json").read_text())
+    assert control_sidecar["record_type"] == "pppp_descriptor"
+    assert control_sidecar["pointer_window"]["span_sectors_used"] == 1
+
+    totals = summary["totals"]
+    assert totals["descriptor_records_found"] == 1
+    assert totals["descriptor_records_parsed"] == 0
+    assert totals["pppp_descriptor_found"] == 1
+    assert totals["pppp_descriptor_parsed"] == 1
+    assert totals["pppp_descriptor_skipped"] == 0
