@@ -8,6 +8,7 @@ import re
 import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from math import gcd
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -54,6 +55,76 @@ def _safe_mkdir(path: Path, force: bool = False) -> None:
             )
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _list_gcd(values: Iterable[int]) -> int:
+    result = 0
+    for value in values:
+        result = gcd(result, abs(value))
+    return result
+
+
+def _detect_track_mapping(
+    image: SCPImage, side: int, present_tracks: Sequence[int] | None = None
+) -> tuple[str, int]:
+    """Infer track spacing from the SCP track table."""
+
+    tracks = list(present_tracks) if present_tracks is not None else None
+    if tracks is None:
+        tracks = image.list_present_tracks(side)
+
+    if not tracks:
+        return "unknown", 1
+
+    normalized = [(track - side) // image.header.sides for track in tracks]
+    deltas = [b - a for a, b in zip(normalized, normalized[1:]) if b != a]
+    spacing_gcd = _list_gcd(deltas) or 1
+    has_odd = any(track % 2 for track in normalized)
+
+    if spacing_gcd == 2 and not has_odd:
+        return "even-only", 2
+    if spacing_gcd not in (1, 2):
+        return "mixed", 1
+    return "dense", 1
+
+
+def map_logical_to_scp_track_id(
+    image: SCPImage,
+    logical_track: int,
+    *,
+    side: int = 0,
+    track_step: str | int = "auto",
+    present_tracks: Sequence[int] | None = None,
+) -> tuple[int, str, int, bool, int]:
+    """Map a logical track number to the SCP track ID for a given side."""
+
+    tracks = list(present_tracks) if present_tracks is not None else None
+    if tracks is None:
+        tracks = image.list_present_tracks(side)
+
+    if track_step == "auto":
+        mapping_mode, step = _detect_track_mapping(image, side, tracks)
+    elif str(track_step) == "1":
+        mapping_mode, step = "forced-dense", 1
+    elif str(track_step) == "2":
+        mapping_mode, step = "forced-even", 2
+    else:
+        raise ValueError(f"Unsupported track step {track_step}")
+
+    expected_track_id = (logical_track * step) * image.header.sides + side
+    if expected_track_id in tracks:
+        return expected_track_id, mapping_mode, step, False, expected_track_id
+
+    if not tracks:
+        raise ValueError(f"No SCP tracks present for side {side}")
+
+    if mapping_mode == "mixed":
+        fallback_track = min(
+            tracks, key=lambda track_id: abs(track_id - expected_track_id)
+        )
+        return fallback_track, mapping_mode, step, True, expected_track_id
+
+    return expected_track_id, mapping_mode, step, False, expected_track_id
 
 
 def _sector_prefix_counts(sectors: dict[int, WangSector]) -> Counter[str]:
@@ -123,19 +194,32 @@ def _pointer_mappings(
 def _write_track_metadata(
     path: Path,
     track_number: int,
-    physical_track: int,
+    scp_track_id: int,
+    expected_track_id: int,
     track_score: float,
     sector_size: int | None,
     hole_shift: int | None,
     prefix_counts: Counter[str],
     sectors: dict[int, WangSector],
     recon: dict[int, SectorReconstruction],
+    *,
+    mapping_mode: str,
+    track_step: int,
+    used_fallback: bool,
+    missing_reason: str | None,
 ) -> None:
     dom_prefix = dominant_prefix(sectors, min_count=1)
     dom_count = prefix_counts.get(dom_prefix or "", 0)
     data = {
         "track_number": track_number,
-        "physical_track": physical_track,
+        "logical_track": track_number,
+        "physical_track": scp_track_id,
+        "scp_track_id": scp_track_id,
+        "expected_scp_track_id": expected_track_id,
+        "track_mapping_mode": mapping_mode,
+        "track_step": track_step,
+        "used_fallback_track": used_fallback,
+        "missing_reason": missing_reason,
         "track_score": track_score,
         "sector_size": sector_size,
         "hole_shift": hole_shift,
@@ -189,6 +273,7 @@ class DiskReconstructor:
         write_manifest: bool = True,
         write_report: bool = True,
         force: bool = False,
+        track_step: str = "auto",
     ) -> None:
         self.image_path = Path(image_path)
         self.output_dir = Path(output_dir)
@@ -204,6 +289,7 @@ class DiskReconstructor:
         self.write_manifest = write_manifest
         self.write_report = write_report
         self.force = force
+        self.track_step = track_step
 
     def run(self) -> ReconstructionResult:
         _safe_mkdir(self.output_dir, force=self.force)
@@ -213,6 +299,10 @@ class DiskReconstructor:
         tracks_dir.mkdir(parents=True, exist_ok=True)
 
         image = SCPImage.from_file(self.image_path)
+        present_tracks = image.list_present_tracks(self.side)
+        mapping_mode, resolved_track_step = self._resolve_track_step(
+            image, present_tracks
+        )
 
         manifest: dict = {
             "image": {
@@ -223,6 +313,12 @@ class DiskReconstructor:
                 "revolutions": image.header.revolutions,
                 "capture_resolution": image.header.capture_resolution,
                 "heads": image.header.heads,
+            },
+            "mapping": {
+                "mode": mapping_mode,
+                "track_step": resolved_track_step,
+                "side": self.side,
+                "present_scp_tracks": present_tracks,
             },
             "tracks": [],
             "totals": {
@@ -240,18 +336,46 @@ class DiskReconstructor:
         dump_base = self.output_dir / "raw_windows" if self.dump_raw_windows else None
 
         for track_number in self.tracks:
-            physical_track = track_number * image.header.sides + self.side
-            sectors, recon, track_score = reconstruct_track(
-                image,
-                track_number=physical_track,
-                logical_sectors=self.logical_sectors,
-                sectors_per_rotation=self.sectors_per_rotation,
-                sector_sizes=self.sector_sizes,
-                keep_best=self.keep_best,
-                similarity_threshold=self.similarity_threshold,
-                clock_factor=self.clock_factor,
-                dump_raw=dump_base,
-            )
+            missing_reason = None
+            try:
+                (
+                    scp_track_id,
+                    _,
+                    track_step_value,
+                    used_fallback_track,
+                    expected_track_id,
+                ) = map_logical_to_scp_track_id(
+                    image,
+                    track_number,
+                    side=self.side,
+                    track_step=self.track_step,
+                    present_tracks=present_tracks,
+                )
+            except ValueError as exc:
+                expected_track_id = (
+                    track_number * resolved_track_step * image.header.sides + self.side
+                )
+                scp_track_id = expected_track_id
+                track_step_value = resolved_track_step
+                used_fallback_track = False
+                sectors, recon, track_score = {}, {}, 0.0
+                missing_reason = str(exc)
+            else:
+                if scp_track_id not in present_tracks and not used_fallback_track:
+                    sectors, recon, track_score = {}, {}, 0.0
+                    missing_reason = "track not present in SCP"
+                else:
+                    sectors, recon, track_score = reconstruct_track(
+                        image,
+                        track_number=scp_track_id,
+                        logical_sectors=self.logical_sectors,
+                        sectors_per_rotation=self.sectors_per_rotation,
+                        sector_sizes=self.sector_sizes,
+                        keep_best=self.keep_best,
+                        similarity_threshold=self.similarity_threshold,
+                        clock_factor=self.clock_factor,
+                        dump_raw=dump_base,
+                    )
             prefix_counts = _sector_prefix_counts(sectors)
             sector_size, hole_shift = _track_selection_stats(recon)
 
@@ -286,20 +410,31 @@ class DiskReconstructor:
             _write_track_metadata(
                 tracks_dir / f"T{track_number:02d}.json",
                 track_number,
-                physical_track,
+                scp_track_id,
+                expected_track_id,
                 track_score,
                 sector_size,
                 hole_shift,
                 prefix_counts,
                 sectors,
                 recon,
+                mapping_mode=mapping_mode,
+                track_step=track_step_value,
+                used_fallback=used_fallback_track,
+                missing_reason=missing_reason,
             )
 
             dom = dominant_prefix(sectors, min_count=1)
             manifest["tracks"].append(
                 {
                     "track_number": track_number,
-                    "physical_track": physical_track,
+                    "logical_track": track_number,
+                    "expected_scp_track_id": expected_track_id,
+                    "scp_track_id": scp_track_id,
+                    "track_mapping_mode": mapping_mode,
+                    "track_step": track_step_value,
+                    "used_fallback_track": used_fallback_track,
+                    "missing_reason": missing_reason,
                     "recovered_sectors": len(sectors),
                     "sector_size": sector_size,
                     "track_score": track_score,
@@ -333,6 +468,17 @@ class DiskReconstructor:
             )
 
         return ReconstructionResult(output_dir=self.output_dir, manifest=manifest)
+
+    def _resolve_track_step(
+        self, image: SCPImage, present_tracks: Sequence[int]
+    ) -> tuple[str, int]:
+        if self.track_step == "auto":
+            return _detect_track_mapping(image, self.side, present_tracks)
+        if self.track_step == "1":
+            return "forced-dense", 1
+        if self.track_step == "2":
+            return "forced-even", 2
+        raise ValueError(f"Unsupported track step {self.track_step}")
 
     def _render_report(
         self,
@@ -398,6 +544,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Logical sectors per track",
+    )
+    recon.add_argument(
+        "--track-step",
+        choices=["auto", "1", "2"],
+        default="auto",
+        help="SCP track spacing: auto-detect, dense (1), or even-only (2)",
     )
     recon.add_argument(
         "--sectors-per-rotation",
@@ -476,6 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_manifest=args.write_json,
             write_report=args.write_report,
             force=args.force,
+            track_step=args.track_step,
         )
         recon.run()
         return 0
