@@ -31,6 +31,9 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
                 + b"\x00\x00"
             )
             content[: len(descriptor)] = descriptor
+        elif sector == 1:
+            content[:] = bytes([sector]) * 256
+            content[16 : 16 + 13] = b"pppp=DOS.MENU"
         else:
             content[:] = bytes([sector]) * 256
         sectors_dir.joinpath(f"T00_S{sector:02d}.bin").write_bytes(content)
@@ -89,9 +92,21 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
     assert sidecar["module_name"] == "SYSGEN.TEST"
     assert sidecar["refs_linear"][:3] == [0, 1, 2]
     assert sidecar["hypothesis_used"] == "H1_le16"
+    assert sidecar["record_type"] == "descriptor"
 
-    assert summary["totals"]["descriptors_found"] == 1
+    totals = summary["totals"]
+    assert totals["descriptor_records_found"] == 1
+    assert totals["descriptor_records_parsed"] == 1
+    assert totals["descriptor_records_skipped"] == 0
+    assert totals["name_list_hits_found"] == 1
+    assert totals["unique_name_list_modules"] == 1
+
     assert summary["by_hypothesis"]["H1_le16"] == 1
+    assert summary["by_hypothesis"]["unparsed_descriptor"] == 0
+
+    name_list_modules = {entry["module_name"]: entry for entry in summary["name_list_modules"]}
+    assert name_list_modules["DOS.MENU"]["count"] == 1
+    assert name_list_modules["DOS.MENU"]["sample_locations"][0]["sector"] == 1
 
 
 def test_only_prefix_normalization(tmp_path: Path) -> None:
@@ -114,12 +129,12 @@ def test_only_prefix_normalization(tmp_path: Path) -> None:
     assert modules_plain == modules_with_equals == {"SYSGEN.TEST"}
 
     totals = summary_with_equals["totals"]
-    assert totals["descriptors_found"] == 1
-    assert totals["parsed_descriptors"] == 1
+    assert totals["descriptor_records_found"] == 1
+    assert totals["descriptor_records_parsed"] == 1
     assert totals["extracted_modules"] == 1
     assert totals["missing_ref_modules"] == 0
     assert totals["bytes_written_total"] > 0
 
     by_hypothesis = summary_with_equals["by_hypothesis"]
     assert by_hypothesis["H1_le16"] == 1
-    assert by_hypothesis["unparsed"] == 0
+    assert by_hypothesis["unparsed_descriptor"] == 0

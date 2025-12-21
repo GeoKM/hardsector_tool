@@ -334,11 +334,22 @@ def extract_modules(
     _safe_mkdir(derived_dir, force=force)
 
     descriptors: list[DescriptorHit] = []
-    pppp_names: set[str] = set()
+    name_list_hits: list[dict] = []
     for (track, sector), payload in sector_db.items():
         descriptors.extend(_scan_descriptors(payload, track, sector))
         for match in PPPP_RE.finditer(payload):
-            pppp_names.add(match.group(1).decode("ascii", errors="ignore"))
+            name_list_hits.append(
+                {
+                    "record_type": "name_list",
+                    "module_name": match.group(1).decode("ascii", errors="ignore"),
+                    "found_at": {
+                        "track": track,
+                        "sector": sector,
+                        "offset": match.start(),
+                    },
+                    "source": "pppp",
+                }
+            )
 
     extracted: list[dict] = []
     per_hypothesis: dict[str, int] = {
@@ -346,7 +357,7 @@ def extract_modules(
         "H2_be16": 0,
         "H3_le32_hi0": 0,
         "H4_ts_pairs": 0,
-        "unparsed": 0,
+        "unparsed_descriptor": 0,
     }
 
     descriptors_found = len(descriptors)
@@ -354,6 +365,17 @@ def extract_modules(
     extracted_modules = 0
     missing_ref_modules = 0
     bytes_written_total = 0
+    unparsed_descriptors: list[dict] = []
+
+    name_list_modules: dict[str, dict] = {}
+    for hit in name_list_hits:
+        entry = name_list_modules.setdefault(
+            hit["module_name"],
+            {"module_name": hit["module_name"], "count": 0, "sample_locations": []},
+        )
+        entry["count"] += 1
+        if len(entry["sample_locations"]) < 5:
+            entry["sample_locations"].append(hit["found_at"])
 
     for name, track, sector, after_offset in descriptors:
         name_upper = name.upper()
@@ -372,26 +394,19 @@ def extract_modules(
             enabled=enabled,
         )
         if hypothesis is None:
-            per_hypothesis["unparsed"] += 1
-            safe_name = _safe_name(name)
-            module_entry = {
-                "module_name": name,
-                "safe_name": safe_name,
-                "found_at": {
-                    "track": track,
-                    "sector": sector,
-                    "offset": after_offset,
-                },
-                "hypothesis_used": None,
-                "refs_linear": [],
-                "refs_ts": [],
-                "refs_count": 0,
-                "missing_refs": [],
-                "bytes_written": 0,
-                "warnings": [],
-                "warnings_count": 0,
-            }
-            extracted.append(module_entry)
+            per_hypothesis["unparsed_descriptor"] += 1
+            if len(unparsed_descriptors) < 10:
+                unparsed_descriptors.append(
+                    {
+                        "record_type": "descriptor",
+                        "module_name": name,
+                        "found_at": {
+                            "track": track,
+                            "sector": sector,
+                            "offset": after_offset,
+                        },
+                    }
+                )
             continue
 
         refs_linear = hypothesis.refs_linear
@@ -408,13 +423,14 @@ def extract_modules(
         warnings: list[str] = []
         if missing:
             warnings.append("some referenced sectors were missing; confidence low")
-        if pppp_names and name not in pppp_names:
+        if name_list_modules and name not in name_list_modules:
             warnings.append("name not seen in pppp= list (if present)")
 
         safe_name = _safe_name(name)
         sidecar = {
             "module_name": name,
             "safe_name": safe_name,
+            "record_type": "descriptor",
             "found_at": {"track": track, "sector": sector, "offset": after_offset},
             "hypothesis_used": hypothesis.name,
             "refs_linear": refs_linear,
@@ -442,28 +458,44 @@ def extract_modules(
 
     skipped_descriptors = descriptors_found - parsed_descriptors
 
+    name_list_hits_found = len(name_list_hits)
+    unique_name_list_modules = len(name_list_modules)
+    name_list_modules_list = sorted(
+        name_list_modules.values(), key=lambda entry: (-entry["count"], entry["module_name"])
+    )
+
     summary = {
-        "modules_extracted": extracted_modules,
         "totals": {
-            "descriptors_found": descriptors_found,
-            "parsed_descriptors": parsed_descriptors,
+            "descriptor_records_found": descriptors_found,
+            "descriptor_records_parsed": parsed_descriptors,
             "extracted_modules": extracted_modules,
-            "skipped_descriptors": skipped_descriptors,
+            "descriptor_records_skipped": skipped_descriptors,
+            "name_list_hits_found": name_list_hits_found,
+            "unique_name_list_modules": unique_name_list_modules,
             "missing_ref_modules": missing_ref_modules,
             "bytes_written_total": bytes_written_total,
         },
         "by_hypothesis": per_hypothesis,
+        "name_list_modules": name_list_modules_list,
+        "descriptor_records_unparsed": unparsed_descriptors,
         "geometry": {
             "tracks": len(geometry.tracks),
             "sectors_per_track": geometry.sectors_per_track,
             "total_sectors": geometry.total_sectors,
         },
-        "pppp_names": sorted(pppp_names),
         "dry_run": dry_run,
         "modules": extracted,
     }
 
     (derived_dir / "extraction_summary.json").write_text(json.dumps(summary, indent=2))
+    print(
+        "Descriptors: "
+        f"found {descriptors_found}, parsed {parsed_descriptors}, extracted {extracted_modules}, "
+        f"skipped {skipped_descriptors}; "
+        f"Name-lists: hits {name_list_hits_found}, unique modules {unique_name_list_modules}; "
+        "hypotheses: "
+        + ", ".join(f"{k}={v}" for k, v in per_hypothesis.items())
+    )
     return summary
 
 
