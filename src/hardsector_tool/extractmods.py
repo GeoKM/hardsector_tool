@@ -316,6 +316,7 @@ def extract_modules(
     max_refs: int = 2000,
     hypotheses: Iterable[str] = ("H1", "H2", "H3", "H4"),
     only_prefix: str | None = None,
+    only_prefix_norm: str | None = None,
     dry_run: bool = False,
     force: bool = False,
 ) -> dict:
@@ -323,6 +324,12 @@ def extract_modules(
     geometry = _derive_geometry(manifest)
     sector_db = load_sector_db(out_dir)
     enabled = {h.strip() for h in hypotheses if h.strip()}
+
+    prefix_clean = only_prefix.strip() if only_prefix else None
+    prefix_norm = (only_prefix_norm or prefix_clean or "").strip().lstrip("=")
+    prefix_norm = prefix_norm or None
+    prefix_norm_upper = prefix_norm.upper() if prefix_norm else None
+    prefix_raw_upper = prefix_clean.upper() if prefix_clean else None
 
     _safe_mkdir(derived_dir, force=force)
 
@@ -342,8 +349,18 @@ def extract_modules(
         "unparsed": 0,
     }
 
+    descriptors_found = len(descriptors)
+    parsed_descriptors = 0
+    extracted_modules = 0
+    missing_ref_modules = 0
+    bytes_written_total = 0
+
     for name, track, sector, after_offset in descriptors:
-        if only_prefix and not name.startswith(only_prefix):
+        name_upper = name.upper()
+        if prefix_norm_upper and not (
+            name_upper.startswith(prefix_norm_upper)
+            or (prefix_raw_upper and name_upper.startswith(prefix_raw_upper))
+        ):
             continue
         payload = sector_db.get((track, sector), b"")
         hypothesis = _choose_hypothesis(
@@ -356,6 +373,25 @@ def extract_modules(
         )
         if hypothesis is None:
             per_hypothesis["unparsed"] += 1
+            safe_name = _safe_name(name)
+            module_entry = {
+                "module_name": name,
+                "safe_name": safe_name,
+                "found_at": {
+                    "track": track,
+                    "sector": sector,
+                    "offset": after_offset,
+                },
+                "hypothesis_used": None,
+                "refs_linear": [],
+                "refs_ts": [],
+                "refs_count": 0,
+                "missing_refs": [],
+                "bytes_written": 0,
+                "warnings": [],
+                "warnings_count": 0,
+            }
+            extracted.append(module_entry)
             continue
 
         refs_linear = hypothesis.refs_linear
@@ -378,13 +414,16 @@ def extract_modules(
         safe_name = _safe_name(name)
         sidecar = {
             "module_name": name,
+            "safe_name": safe_name,
             "found_at": {"track": track, "sector": sector, "offset": after_offset},
             "hypothesis_used": hypothesis.name,
             "refs_linear": refs_linear,
             "refs_ts": [{"track": t, "sector": s} for t, s in refs_ts],
+            "refs_count": len(refs_linear),
             "missing_refs": missing,
             "bytes_written": len(buffer),
             "warnings": warnings,
+            "warnings_count": len(warnings),
         }
 
         if not dry_run:
@@ -394,11 +433,26 @@ def extract_modules(
             )
 
         per_hypothesis[hypothesis.name] += 1
+        parsed_descriptors += 1
+        extracted_modules += 1
+        if missing:
+            missing_ref_modules += 1
+        bytes_written_total += 0 if dry_run else len(buffer)
         extracted.append(sidecar)
 
+    skipped_descriptors = descriptors_found - parsed_descriptors
+
     summary = {
-        "modules_extracted": len(extracted),
-        "per_hypothesis": per_hypothesis,
+        "modules_extracted": extracted_modules,
+        "totals": {
+            "descriptors_found": descriptors_found,
+            "parsed_descriptors": parsed_descriptors,
+            "extracted_modules": extracted_modules,
+            "skipped_descriptors": skipped_descriptors,
+            "missing_ref_modules": missing_ref_modules,
+            "bytes_written_total": bytes_written_total,
+        },
+        "by_hypothesis": per_hypothesis,
         "geometry": {
             "tracks": len(geometry.tracks),
             "sectors_per_track": geometry.sectors_per_track,
@@ -456,13 +510,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "extract-modules":
         hypotheses = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
+        only_prefix = args.only_prefix.strip() if args.only_prefix else None
+        prefix_norm = only_prefix.lstrip("=") if only_prefix else None
         extract_modules(
             args.out_dir,
             args.out,
             min_refs=args.min_refs,
             max_refs=args.max_refs,
             hypotheses=hypotheses,
-            only_prefix=args.only_prefix,
+            only_prefix=only_prefix,
+            only_prefix_norm=prefix_norm,
             dry_run=args.dry_run,
             force=args.force,
         )
