@@ -31,14 +31,6 @@ pip install -U pip
 pip install -e .
 ```
 
-Run commands as:
-
-```bash
-python -m hardsector_tool --help
-```
-
----
-
 ## Inputs
 
 ### Flux images
@@ -66,14 +58,33 @@ This produces a directory containing:
 * per-track reports (`tracks/*.json`)
 * `manifest.json` and summary stats
 
-Example:
+Examples:
 
-```bash
-python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_v3
-python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_v3
-```
+* Default run (auto track step):
 
-**What you get:** a *logical sector database* suitable for analysis and repeatability.
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_v3
+  ```
+
+* Force even-only track step:
+
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_step2 --track-step 2
+  ```
+
+* Explicit holes-per-rev with pruning:
+
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_keep5 --sectors-per-rotation 16 --keep-best 5
+  ```
+
+* (Optional) cautious debug run:
+
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_debug --dump-raw-windows
+  ```
+
+**What you get:** a *logical sector database* suitable for analysis and repeatability. Preserve it alongside the original `.scp`.
 
 ---
 
@@ -117,6 +128,43 @@ python -m hardsector_tool extract-modules out_80221_v3 --out derived_80221 --min
 python -m hardsector_tool extract-modules out_80217_v3 --out derived_80217 --min-refs 3 --force
 ```
 
+* Conservative run:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80217_v3 --out derived_80217_cons --min-refs 3
+  ```
+
+* SYSGEN focus:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen --only-prefix SYSGEN. --min-refs 3
+  ```
+
+* Choose hypotheses:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80221_v3 --out derived_h13 --hypotheses H1,H3 --min-refs 3
+  ```
+
+* Toggle pppp descriptor carving:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_on --enable-pppp-descriptors --min-refs 3
+  python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_off --no-enable-pppp-descriptors --min-refs 3
+  ```
+
+* Span pppp pointers across sectors:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80221_v3 --out derived_span1 --pppp-span-sectors 1 --min-refs 3
+  ```
+
+* Reduce false positives:
+
+  ```bash
+  python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen_safe --only-prefix SYSGEN. --require-name-in-pppp-list --min-refs 3
+  ```
+
 #### Focus on a module family (prefix filter)
 
 Prefix matching is normalized, so these behave the same:
@@ -145,9 +193,18 @@ Optional pppp-based descriptor carving (if your hypothesis suggests names-with-p
 
 ```bash
 python -m hardsector_tool --help
-python -m hardsector_tool extract-modules --help
 python -m hardsector_tool scan-metadata --help
+python -m hardsector_tool reconstruct-disk --help
+python -m hardsector_tool extract-modules --help
 ```
+
+**Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules}`
+
+**reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
+
+**scan-metadata options:** `--out OUT out_dir`
+
+**extract-modules options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, `--dry-run`, `--force`
 
 ---
 
@@ -182,6 +239,11 @@ python -m hardsector_tool scan-metadata --help
 
 * `--require-name-in-pppp-list`
   Safety filter for true descriptors: only extract if the module name appears in `pppp=` lists on disk
+
+### Option glossary (pppp-related)
+
+* `--enable-pppp-descriptors` / `--no-enable-pppp-descriptors`: enable or disable treating `pppp=` entries with embedded pointers as extractable descriptors.
+* `--pppp-span-sectors N`: allow reading pointer bytes from the next sector while decoding `pppp=` entries.
 
 ### Record types in output
 
