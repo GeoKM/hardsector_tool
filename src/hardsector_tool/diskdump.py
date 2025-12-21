@@ -603,6 +603,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow overwriting an existing output directory",
     )
 
+    scan = subparsers.add_parser(
+        "scan-metadata",
+        help="Scan reconstructed sectors for metadata and directory-like structures",
+    )
+    scan.add_argument("out_dir", type=Path, help="Reconstruction output directory")
+    scan.add_argument("--out", required=True, type=Path, help="Output JSON path")
+
     return parser
 
 
@@ -631,6 +638,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             track_step=args.track_step,
         )
         recon.run()
+        return 0
+
+    if args.command == "scan-metadata":
+        from . import scanmeta
+
+        result = scanmeta.scan_metadata(args.out_dir)
+        args.out.write_text(json.dumps(result, indent=2))
         return 0
 
     parser.error(f"Unknown command {args.command}")

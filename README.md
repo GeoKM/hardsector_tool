@@ -49,6 +49,15 @@ Key options:
 - Mark hunting: `--scan-bit-patterns`, `--bruteforce-marks`, `--mark-payload-dir`, `--fixed-spacing-scan`, `--report-entropy`, `--mark-payload-bytes`, `--bruteforce-step-bits`.
 - Heuristics: `--score-grid` ranks FM/MFM candidates across clock scales and polarity; `--sector-map`, `--write-sectors`, `--image-out` assemble best-effort sector maps (missing sectors fill with 0x00).
 
+## CLI: scan-metadata
+Scan reconstructed logical sectors (output of `reconstruct-disk`) for catalog-like structures, name tables, and pointer evidence. This does not assume a filesystem and writes a JSON summary for reverse-engineering.
+
+```
+python -m hardsector_tool scan-metadata decoded/wang_recon --out decoded/metadata.json
+```
+
+The scanner works over `manifest.json` plus the `sectors/` and `tracks/` directories, flags dense name tables and record cadences, tallies likely pointer encodings, and records signature strings in context.
+
 ## Current Wang OIS 100 findings
 - SCP headers show 198 revolutions per track; 77 even-numbered tracks have offsets; 32 sector holes plus one index per rotation. Index alignment is flagged in the header and respected when grouping.
 - Hole-level decodes remain mostly uniform (0xFF or, when inverted, 0x00) across both disks. FM/MFM scans (sync/no-sync, PLL tuning, merged holes, fixed-spacing slices, stitched rotation) have not yielded valid CRCs or obvious structure; assembled images stay filler.
