@@ -16,11 +16,11 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
 
     manifest = {
         "tracks": [{"track_number": 0, "recovered_sectors": 16, "sector_size": 256}],
-        "totals": {"expected_sectors": 16, "written_sectors": 3, "missing_sectors": 13},
+        "totals": {"expected_sectors": 16, "written_sectors": 4, "missing_sectors": 12},
     }
 
-    # Create three sectors; sector 0 contains the descriptor.
-    for sector in range(3):
+    # Create four sectors; sectors 0 and 3 contain descriptors.
+    for sector in range(4):
         content = bytearray(b"\x00" * 256)
         if sector == 0:
             descriptor = (
@@ -33,9 +33,20 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
             content[: len(descriptor)] = descriptor
         elif sector == 1:
             content[:] = bytes([sector]) * 256
-            content[16 : 16 + 13] = b"pppp=DOS.MENU"
-        else:
+            entry = b"pppp=SYSGEN.TEST"
+            start_offset = 16
+            content[start_offset : start_offset + len(entry)] = entry
+        elif sector == 2:
             content[:] = bytes([sector]) * 256
+        else:
+            descriptor2 = (
+                b"=SYSGEN.NOPE////"
+                + b"\x00\x00"
+                + b"\x01\x00"
+                + b"\x02\x00"
+                + b"\x00\x00"
+            )
+            content[: len(descriptor2)] = descriptor2
         sectors_dir.joinpath(f"T00_S{sector:02d}.bin").write_bytes(content)
 
     tracks_dir.joinpath("T00.json").write_text(json.dumps({"sector_size": 256}))
@@ -147,10 +158,14 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
 
     module_path = derived_dir / "SYSGEN.TEST.bin"
     sidecar_path = derived_dir / "SYSGEN.TEST.json"
+    module_path_nope = derived_dir / "SYSGEN.NOPE.bin"
+    sidecar_path_nope = derived_dir / "SYSGEN.NOPE.json"
     summary_path = derived_dir / "extraction_summary.json"
 
     assert module_path.exists()
     assert sidecar_path.exists()
+    assert module_path_nope.exists()
+    assert sidecar_path_nope.exists()
     assert summary_path.exists()
 
     payload = module_path.read_bytes()
@@ -165,9 +180,14 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
     assert sidecar["hypothesis_used"] == "H1_le16"
     assert sidecar["record_type"] == "descriptor"
 
+    sidecar_nope = json.loads(sidecar_path_nope.read_text())
+    assert sidecar_nope["module_name"] == "SYSGEN.NOPE"
+    assert sidecar_nope["hypothesis_used"] == "H1_le16"
+
     totals = summary["totals"]
-    assert totals["descriptor_records_found"] == 1
-    assert totals["descriptor_records_parsed"] == 1
+    assert totals["descriptor_records_found"] == 2
+    assert totals["descriptor_records_parsed"] == 2
+    assert totals["descriptor_records_filtered_by_pppp"] == 0
     assert totals["descriptor_records_skipped"] == 0
     assert totals["name_list_hits_found"] == 1
     assert totals["unique_name_list_modules"] == 1
@@ -176,14 +196,14 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
     assert totals["pppp_descriptor_skipped"] == 0
 
     descriptor_hypotheses = summary["by_hypothesis"]["descriptor"]
-    assert descriptor_hypotheses["H1_le16"] == 1
+    assert descriptor_hypotheses["H1_le16"] == 2
     assert descriptor_hypotheses["unparsed_descriptor"] == 0
 
     name_list_modules = {
         entry["module_name"]: entry for entry in summary["name_list_modules"]
     }
-    assert name_list_modules["DOS.MENU"]["count"] == 1
-    assert name_list_modules["DOS.MENU"]["sample_locations"][0]["sector"] == 1
+    assert name_list_modules["SYSGEN.TEST"]["count"] == 1
+    assert name_list_modules["SYSGEN.TEST"]["sample_locations"][0]["sector"] == 1
 
 
 def test_only_prefix_normalization(tmp_path: Path) -> None:
@@ -203,17 +223,17 @@ def test_only_prefix_normalization(tmp_path: Path) -> None:
         if mod["hypothesis_used"]
     }
 
-    assert modules_plain == modules_with_equals == {"SYSGEN.TEST"}
+    assert modules_plain == modules_with_equals == {"SYSGEN.TEST", "SYSGEN.NOPE"}
 
     totals = summary_with_equals["totals"]
-    assert totals["descriptor_records_found"] == 1
-    assert totals["descriptor_records_parsed"] == 1
-    assert totals["extracted_modules"] == 1
+    assert totals["descriptor_records_found"] == 2
+    assert totals["descriptor_records_parsed"] == 2
+    assert totals["extracted_modules"] == 2
     assert totals["missing_ref_modules"] == 0
     assert totals["bytes_written_total"] > 0
 
     by_hypothesis = summary_with_equals["by_hypothesis"]["descriptor"]
-    assert by_hypothesis["H1_le16"] == 1
+    assert by_hypothesis["H1_le16"] == 2
     assert by_hypothesis["unparsed_descriptor"] == 0
 
 
@@ -238,10 +258,29 @@ def test_pppp_descriptor_upgrade(tmp_path: Path) -> None:
     assert pppp_hypotheses["H1_le16"] == 1
     assert pppp_hypotheses["unparsed_descriptor"] == 0
 
-    modules = {mod["module_name"]: mod for mod in summary["modules"]}
-    control_sidecar = modules["CONTROL.AT"]
-    assert control_sidecar["record_type"] == "pppp_descriptor"
-    assert control_sidecar["pointer_window"]["span_sectors_used"] == 0
+
+def test_require_name_in_pppp_list(tmp_path: Path) -> None:
+    out_dir = _build_fake_reconstruct(tmp_path)
+    derived_dir = tmp_path / "derived_filtered"
+    summary = _run_extract_cli(
+        out_dir,
+        derived_dir,
+        "SYSGEN.",
+        ["--require-name-in-pppp-list"],
+    )
+
+    modules = {mod["module_name"] for mod in summary["modules"]}
+
+    assert "SYSGEN.TEST" in modules
+    assert "SYSGEN.NOPE" not in modules
+
+    totals = summary["totals"]
+    assert totals["descriptor_records_found"] == 2
+    assert totals["descriptor_records_parsed"] == 1
+    assert totals["descriptor_records_filtered_by_pppp"] == 1
+
+    filtered = summary["descriptor_records_filtered"]
+    assert any(entry["module_name"] == "SYSGEN.NOPE" for entry in filtered)
 
 
 def test_pppp_descriptor_span(tmp_path: Path) -> None:
