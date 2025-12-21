@@ -192,6 +192,19 @@ class SCPImage:
             flux_data_offset=first_offset,
         )
 
+    def list_present_tracks(self, side: int) -> List[int]:
+        """Return physical SCP track IDs present for a given side."""
+
+        if side < 0 or side >= self.header.sides:
+            raise ValueError(f"Side {side} out of range for {self.header.sides} heads")
+
+        tracks = [
+            idx
+            for idx, offset in enumerate(self.header.track_offsets)
+            if offset and idx % self.header.sides == side
+        ]
+        return sorted(tracks)
+
 
 def decode_flux_segment(segment: bytes) -> List[int]:
     """
