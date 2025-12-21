@@ -84,6 +84,14 @@ Examples:
   python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_debug --dump-raw-windows
   ```
 
+* Fast sanity run (decode just a few tracks while iterating):
+
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_t0_5 --tracks 0-5 --side 0
+  ```
+
+Useful during development to validate decoding/mapping quickly before processing the full disk.
+
 **What you get:** a *logical sector database* suitable for analysis and repeatability. Preserve it alongside the original `.scp`.
 
 ---
@@ -152,6 +160,8 @@ python -m hardsector_tool extract-modules out_80217_v3 --out derived_80217 --min
   python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_on --enable-pppp-descriptors --min-refs 3
   python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_off --no-enable-pppp-descriptors --min-refs 3
   ```
+
+  Note: if pppp descriptors are already enabled by default in your build, you can omit `--enable-pppp-descriptors`.
 
 * Span pppp pointers across sectors:
 
@@ -223,7 +233,7 @@ python -m hardsector_tool extract-modules --help
   Comma-separated pointer decoding hypotheses to try (matches CLI `--hypotheses`)
 
 * `--enable-pppp-descriptors` / `--no-enable-pppp-descriptors`
-  Toggle treating `pppp=` entries with embedded pointers as descriptors (off by default)
+  Enable/disable treating `pppp=` entries with embedded pointers as extractable descriptors (see `extract-modules --help` for default)
 
 * `--pppp-span-sectors N`
   Allow including bytes from the next sector when decoding `pppp=` pointer lists
@@ -243,6 +253,7 @@ python -m hardsector_tool extract-modules --help
 ### Option glossary (pppp-related)
 
 * `--enable-pppp-descriptors` / `--no-enable-pppp-descriptors`: enable or disable treating `pppp=` entries with embedded pointers as extractable descriptors.
+  (See `--help` for default.)
 * `--pppp-span-sectors N`: allow reading pointer bytes from the next sector while decoding `pppp=` entries.
 
 ### Record types in output
