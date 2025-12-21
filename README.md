@@ -58,6 +58,18 @@ python -m hardsector_tool scan-metadata decoded/wang_recon --out decoded/metadat
 
 The scanner works over `manifest.json` plus the `sectors/` and `tracks/` directories, flags dense name tables and record cadences, tallies likely pointer encodings, and records signature strings in context.
 
+## CLI: extract-modules (experimental)
+This subcommand carves evidence-backed module payloads from reconstructed sectors. It is not a filesystem extractor and never modifies the original sector database; every carved module carries provenance and a JSON sidecar.
+
+Examples:
+
+```bash
+python -m hardsector_tool extract-modules decoded/wang_recon --out decoded/modules
+python -m hardsector_tool extract-modules decoded/wang_recon --out decoded/modules --only-prefix "=SYSGEN."
+```
+
+Keep your original SCP captures and reconstruction outputs alongside any derived modules so provenance and future experiments remain possible.
+
 ## Current Wang OIS 100 findings
 - SCP headers show 198 revolutions per track; 77 even-numbered tracks have offsets; 32 sector holes plus one index per rotation. Index alignment is flagged in the header and respected when grouping.
 - Hole-level decodes remain mostly uniform (0xFF or, when inverted, 0x00) across both disks. FM/MFM scans (sync/no-sync, PLL tuning, merged holes, fixed-spacing slices, stitched rotation) have not yielded valid CRCs or obvious structure; assembled images stay filler.
