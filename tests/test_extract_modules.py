@@ -40,9 +40,7 @@ def _build_fake_reconstruct(tmp_path: Path) -> Path:
     return out_dir
 
 
-def test_extract_modules_cli(tmp_path: Path) -> None:
-    out_dir = _build_fake_reconstruct(tmp_path)
-    derived_dir = tmp_path / "derived"
+def _run_extract_cli(out_dir: Path, derived_dir: Path, only_prefix: str) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
 
@@ -56,10 +54,22 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
         str(derived_dir),
         "--min-refs",
         "2",
+        "--only-prefix",
+        only_prefix,
     ]
 
     result = subprocess.run(cmd, check=False, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+    summary_path = derived_dir / "extraction_summary.json"
+    assert summary_path.exists()
+    return json.loads(summary_path.read_text())
+
+
+def test_extract_modules_cli(tmp_path: Path) -> None:
+    out_dir = _build_fake_reconstruct(tmp_path)
+    derived_dir = tmp_path / "derived"
+    summary = _run_extract_cli(out_dir, derived_dir, "SYSGEN.")
 
     module_path = derived_dir / "SYSGEN.TEST.bin"
     sidecar_path = derived_dir / "SYSGEN.TEST.json"
@@ -79,3 +89,37 @@ def test_extract_modules_cli(tmp_path: Path) -> None:
     assert sidecar["module_name"] == "SYSGEN.TEST"
     assert sidecar["refs_linear"][:3] == [0, 1, 2]
     assert sidecar["hypothesis_used"] == "H1_le16"
+
+    assert summary["totals"]["descriptors_found"] == 1
+    assert summary["by_hypothesis"]["H1_le16"] == 1
+
+
+def test_only_prefix_normalization(tmp_path: Path) -> None:
+    out_dir = _build_fake_reconstruct(tmp_path)
+
+    summary_plain = _run_extract_cli(out_dir, tmp_path / "derived_plain", "SYSGEN.")
+    summary_with_equals = _run_extract_cli(
+        out_dir, tmp_path / "derived_equals", "=SYSGEN."
+    )
+
+    modules_plain = {
+        mod["module_name"] for mod in summary_plain["modules"] if mod["hypothesis_used"]
+    }
+    modules_with_equals = {
+        mod["module_name"]
+        for mod in summary_with_equals["modules"]
+        if mod["hypothesis_used"]
+    }
+
+    assert modules_plain == modules_with_equals == {"SYSGEN.TEST"}
+
+    totals = summary_with_equals["totals"]
+    assert totals["descriptors_found"] == 1
+    assert totals["parsed_descriptors"] == 1
+    assert totals["extracted_modules"] == 1
+    assert totals["missing_ref_modules"] == 0
+    assert totals["bytes_written_total"] > 0
+
+    by_hypothesis = summary_with_equals["by_hypothesis"]
+    assert by_hypothesis["H1_le16"] == 1
+    assert by_hypothesis["unparsed"] == 0

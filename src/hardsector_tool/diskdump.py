@@ -655,13 +655,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         from . import extractmods
 
         hypotheses = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
+        only_prefix = args.only_prefix.strip() if args.only_prefix else None
+        prefix_norm = only_prefix.lstrip("=") if only_prefix else None
         extractmods.extract_modules(
             args.out_dir,
             args.out,
             min_refs=args.min_refs,
             max_refs=args.max_refs,
             hypotheses=hypotheses,
-            only_prefix=args.only_prefix,
+            only_prefix=only_prefix,
+            only_prefix_norm=prefix_norm,
             dry_run=args.dry_run,
             force=args.force,
         )
