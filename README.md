@@ -262,7 +262,7 @@ python -m hardsector_tool extract-modules --help
 
 * **descriptor records**: true `=NAME//// ... pointer list ...`
 * **name list hits**: `pppp=NAME.EXT` occurrences (not necessarily extractable)
-* (when `--enable-pppp-descriptors` is used) **pppp descriptors**: `pppp=` entries upgraded to extractable when a pointer list is found after padding
+* (when pppp descriptor extraction is enabled) **pppp descriptors**: `pppp=` entries upgraded to extractable when a pointer list is found after padding
 
 This is intentional: it prevents name lists from inflating descriptor counts and keeps summaries interpretable.
 
