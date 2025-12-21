@@ -50,6 +50,23 @@ pip install -e .
 
 ## Quickstart workflow
 
+### Step 0.5 — QC the capture or reconstruction
+
+Use `qc-capture` to generate a preservation-focused report (brief by default, detail for deeper evidence). The command prints a
+human-readable summary and writes JSON alongside the inputs unless `--out` is provided.
+
+```bash
+# SCP capture integrity
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode brief
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode detail --sectors-per-rotation 16 --revs 5
+
+# Reconstruction output health
+python -m hardsector_tool qc-capture out_80221_v3 --mode brief
+python -m hardsector_tool qc-capture out_80221_v3 --mode detail --out qc_out.json
+```
+
+By default the JSON is saved as `qc_<image>.json` for SCP inputs or `<out_dir>/qc.json` for reconstruction directories.
+
 ### Step 1 — Reconstruct logical sectors from a flux image
 
 This produces a directory containing:

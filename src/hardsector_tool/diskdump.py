@@ -614,6 +614,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     extractmods.build_arg_parser(subparsers)
 
+    qc = subparsers.add_parser(
+        "qc-capture",
+        help="Quality control report for SCP capture and/or reconstruction output",
+    )
+    qc.add_argument("input", type=Path, help="SCP image or reconstruction output")
+    qc.add_argument(
+        "--mode",
+        choices=["brief", "detail"],
+        default="brief",
+        help="Summary (brief) or detailed report",
+    )
+    qc.add_argument("--out", type=Path, help="Optional JSON output path")
+    qc.add_argument("--tracks", default="0-76", help="Track range for SCP inputs")
+    qc.add_argument("--side", type=int, default=0, help="Head/side index for SCP inputs")
+    qc.add_argument(
+        "--track-step",
+        choices=["auto", "1", "2"],
+        default="auto",
+        help="SCP track spacing assumption for capture QC",
+    )
+    qc.add_argument(
+        "--sectors-per-rotation",
+        type=int,
+        default=None,
+        help="Hard-sector holes per rotation (SCP QC only)",
+    )
+    qc.add_argument("--revs", type=int, default=None, help="Expected revolutions for capture")
+    qc.add_argument(
+        "--fail-thresholds",
+        default="conservative",
+        help="Failure threshold presets (reserved for future use)",
+    )
+
     return parser
 
 
@@ -671,6 +704,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             force=args.force,
         )
+        return 0
+
+    if args.command == "qc-capture":
+        from . import qc
+
+        track_list = _parse_track_range(args.tracks) if args.tracks else None
+        try:
+            report = qc.qc_capture(
+                args.input,
+                mode=args.mode,
+                tracks=track_list,
+                side=args.side,
+                track_step=args.track_step,
+                sectors_per_rotation=args.sectors_per_rotation,
+                revs=args.revs,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        out_path = args.out or qc.default_output_path(args.input, report)
+        out_path.write_text(json.dumps(report, indent=2))
+
+        if args.mode == "detail":
+            print(qc.format_detail_summary(report))
+        else:
+            print(qc.summarize_qc(report))
         return 0
 
     parser.error(f"Unknown command {args.command}")
