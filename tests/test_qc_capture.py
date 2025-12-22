@@ -147,8 +147,11 @@ def test_scp_capture_reports_hole_interval(monkeypatch, tmp_path: Path) -> None:
 
     assert track_entry["windows_captured"] == 2
     assert track_entry["expected_windows"] == 8
-    assert track_entry["hole_interval"]["cv"] is not None
-    assert any("hole_interval_cv" in reason for reason in report["overall"]["reasons"])
+    assert (
+        track_entry["hole_interval"].get("cv") is not None
+        or track_entry.get("hole_interval_cv_noindex") is not None
+    )
+    assert any("hole timing" in reason for reason in report["overall"]["reasons"])
 
 
 def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) -> None:
@@ -180,14 +183,16 @@ def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) ->
     output = qc.format_detail_summary(report)
 
     assert "windows=" in output
-    assert "crc_fail=" not in output
-    assert "no_decode=" not in output
+    assert "Reconstruction: not run" in output
 
 
 def test_brief_reasons_are_summarized(monkeypatch, tmp_path: Path) -> None:
     class FakeTrack:
         def __init__(self) -> None:
-            self.revolutions = [SimpleNamespace(index_ticks=1000), SimpleNamespace(index_ticks=5000)]
+            self.revolutions = [
+                SimpleNamespace(index_ticks=1000),
+                SimpleNamespace(index_ticks=5000),
+            ]
             self.revolution_count = len(self.revolutions)
 
         def decode_flux(self, rev_index: int):
@@ -214,7 +219,7 @@ def test_brief_reasons_are_summarized(monkeypatch, tmp_path: Path) -> None:
 
     reasons = report["overall"]["reasons"]
     assert len(reasons) < 5
-    assert any("hole_interval_cv elevated" in reason for reason in reasons)
+    assert any("hole timing" in reason for reason in reasons)
 
 
 def test_reconstruction_failures_listed(tmp_path: Path) -> None:
@@ -240,9 +245,9 @@ def test_reconstruction_failures_listed(tmp_path: Path) -> None:
     report = qc.qc_from_outdir(out_dir, mode="detail")
     output = qc.format_detail_summary(report)
 
-    assert "Failures:" in output
-    assert "T00 S00: CRC_FAIL" in output
-    assert "T00 S01: MISSING" in output
+    assert "Sector failures:" in output
+    assert "T00 S00 FAIL = CRC_FAIL" in output
+    assert "T00 S01 FAIL = MISSING" in output
 
 
 def _write_minimal_recon_out(out_dir: Path) -> None:
@@ -256,7 +261,9 @@ def _write_minimal_recon_out(out_dir: Path) -> None:
         "totals": {"expected_sectors": 1, "written_sectors": 1, "missing_sectors": 0},
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
-    tracks_dir.joinpath("T00.json").write_text(json.dumps({"sectors": [{"sector_id": 0}]}))
+    tracks_dir.joinpath("T00.json").write_text(
+        json.dumps({"sectors": [{"sector_id": 0}]})
+    )
     sectors_dir.joinpath("T00_S00.bin").write_bytes(b"ok")
 
 
@@ -362,7 +369,8 @@ def test_qc_capture_pipeline_uses_cache(monkeypatch, tmp_path: Path) -> None:
     scp_path = tmp_path / "image.scp"
     scp_path.write_bytes(b"data")
 
-    report = qc.qc_capture(scp_path, mode="detail", tracks=[0])
+    cache_dir = tmp_path / "cache"
+    report = qc.qc_capture(scp_path, mode="detail", tracks=[0], cache_dir=cache_dir)
 
     assert report["pipeline"] == ["capture_qc", "reconstruct", "reconstruction_qc"]
     assert report["reconstruct"]["used_cache"] is False
@@ -370,7 +378,9 @@ def test_qc_capture_pipeline_uses_cache(monkeypatch, tmp_path: Path) -> None:
     assert runs
 
     # Second run should reuse cache without invoking reconstructor again
-    report_cached = qc.qc_capture(scp_path, mode="detail", tracks=[0])
+    report_cached = qc.qc_capture(
+        scp_path, mode="detail", tracks=[0], cache_dir=cache_dir
+    )
 
     assert report_cached["reconstruct"]["used_cache"] is True
     assert len(runs) == 1
@@ -417,3 +427,56 @@ def test_qc_capture_out_dir_pipeline(tmp_path: Path) -> None:
 
     assert report["pipeline"] == ["reconstruction_qc"]
     assert report.get("reconstruct", {}).get("enabled") is False
+
+
+def test_hole_interval_metrics_ignore_index_gap() -> None:
+    revolutions = [
+        SimpleNamespace(index_ticks=v) for v in [100, 102, 98, 300, 101, 99, 100, 310]
+    ]
+
+    stats = qc._hole_interval_metrics(revolutions, 4)
+
+    assert stats["cv"] > 0.1
+    assert stats["cv_noindex"] is not None
+    assert stats["cv_noindex"] < stats["cv"]
+
+
+def test_top_issues_empty_when_zero() -> None:
+    report = {
+        "overall": {
+            "status": "PASS",
+            "reasons": ["all checks passed"],
+            "suggestions": [],
+        },
+        "capture_qc": {
+            "per_track": [
+                {
+                    "track": 0,
+                    "windows_captured": 1,
+                    "expected_windows": 1,
+                    "hole_interval": {},
+                    "hole_interval_cv_noindex": None,
+                    "index_gap_ratio": None,
+                    "anomalies": {"dropouts": 0, "noise": 0},
+                    "status": "PASS",
+                }
+            ],
+            "missing_tracks": [],
+        },
+        "reconstruction_qc": {},
+        "reconstruction_per_track": [
+            {
+                "track": 0,
+                "sectors_present": 1,
+                "sectors_expected": 1,
+                "missing_sectors": [],
+                "crc_fail": 0,
+                "no_decode": 0,
+                "low_confidence": 0,
+            }
+        ],
+    }
+
+    top_line = qc._format_top_issues_line(report)
+
+    assert "No affected tracks" in top_line

@@ -115,6 +115,7 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
     missing_sectors: list[tuple[int, int]] = []
     per_track_entries: list[dict] = []
     per_sector_entries: list[dict] = []
+    per_sector_failures: list[dict] = []
     crc_like_total = 0
     no_decode_total = 0
     low_conf_total = 0
@@ -172,17 +173,30 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
         no_decode_total += no_decode
         low_conf_total += low_conf
 
-        if mode == "detail":
-            for sector in track_meta.get("sectors", []):
-                status = (sector.get("status") or "").upper()
-                if status in {"CRC_FAIL", "NO_DECODE", "UNREADABLE", "LOW_CONFIDENCE"}:
-                    per_sector_entries.append(
-                        {
-                            "track": track_number,
-                            "sector": int(sector.get("sector_id", -1)),
-                            "status": status,
-                        }
-                    )
+        for sector in track_meta.get("sectors", []):
+            status = (sector.get("status") or "").upper()
+            if status in {"CRC_FAIL", "NO_DECODE", "UNREADABLE", "LOW_CONFIDENCE"}:
+                entry = {
+                    "track": track_number,
+                    "sector": int(sector.get("sector_id", -1)),
+                    "status": status,
+                }
+                if mode == "detail":
+                    per_sector_entries.append(entry)
+                code = status
+                sector_status = "FAIL"
+                if status == "LOW_CONFIDENCE":
+                    sector_status = "WARN"
+                    code = "LOW_CONF"
+                per_sector_failures.append(
+                    {
+                        "track": track_number,
+                        "sector": int(sector.get("sector_id", -1)),
+                        "status": sector_status,
+                        "code": code,
+                        "detail": sector.get("detail"),
+                    }
+                )
 
     totals = manifest.get("totals") or {}
     missing_count = totals.get("missing_sectors") or len(missing_sectors)
@@ -235,14 +249,21 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
         "written_sectors": totals.get("written_sectors"),
     }
 
+    reason_payload = reasons or (
+        ["all checks passed"] if overall_status == "PASS" else []
+    )
     report["overall"] = {
         "status": overall_status,
-        "reasons": reasons or ["all checks passed"],
+        "reasons": reason_payload,
         "suggestions": suggestions,
     }
     report["reconstruction_qc"] = reconstruction_qc
     report["per_track"] = per_track_entries
     report["reconstruction_per_track"] = per_track_entries
+    reconstruction_qc["per_sector_failures"] = per_sector_failures + [
+        {"track": t, "sector": s, "status": "FAIL", "code": "MISSING", "detail": None}
+        for t, s in missing_sectors
+    ]
     if mode == "detail":
         bad_sectors = [
             {"track": t, "sector": s, "status": "MISSING"} for t, s in missing_sectors
@@ -271,6 +292,47 @@ def _hole_interval_stats(values: Iterable[int]) -> dict:
     stdev = statistics.pstdev(vals)
     cv = stdev / mean if mean else None
     return {"mean": mean, "stdev": stdev, "cv": cv}
+
+
+def _hole_interval_metrics(
+    revolutions: Sequence[object], holes_per_rotation: int | None
+) -> dict:
+    intervals = [getattr(rev, "index_ticks", None) for rev in revolutions]
+    intervals = [v for v in intervals if v is not None]
+    base_stats = _hole_interval_stats(intervals)
+    cv_noindex = None
+    index_gap_ratio = None
+
+    if holes_per_rotation and holes_per_rotation > 1 and intervals:
+        trimmed: list[int] = []
+        ratios: list[float] = []
+        for start in range(0, len(intervals), holes_per_rotation):
+            group = intervals[start : start + holes_per_rotation]
+            if len(group) < 2:
+                continue
+            max_interval = max(group)
+            median_interval = statistics.median(group)
+            if median_interval:
+                ratios.append(max_interval / median_interval)
+            remaining = list(group)
+            try:
+                remaining.pop(remaining.index(max_interval))
+            except ValueError:
+                pass
+            trimmed.extend(remaining)
+
+        if trimmed:
+            cv_noindex = _hole_interval_stats(trimmed).get("cv")
+        if ratios:
+            index_gap_ratio = statistics.median(ratios)
+
+    return {
+        "mean": base_stats.get("mean"),
+        "stdev": base_stats.get("stdev"),
+        "cv": base_stats.get("cv"),
+        "cv_noindex": cv_noindex,
+        "index_gap_ratio": index_gap_ratio,
+    }
 
 
 def qc_from_scp(
@@ -325,7 +387,10 @@ def qc_from_scp(
                     "expected_windows": None,
                     "hole_interval": {"mean": None, "stdev": None, "cv": None},
                     "revs_estimated": None,
+                    "hole_interval_cv_noindex": None,
+                    "index_gap_ratio": None,
                     "anomalies": {"dropouts": 0, "noise": 0},
+                    "status": "FAIL",
                     "notes": [str(exc)],
                 }
             )
@@ -341,8 +406,11 @@ def qc_from_scp(
                     "windows_captured": 0,
                     "expected_windows": None,
                     "hole_interval": {"mean": None, "stdev": None, "cv": None},
+                    "hole_interval_cv_noindex": None,
+                    "index_gap_ratio": None,
                     "revs_estimated": None,
                     "anomalies": {"dropouts": 0, "noise": 0},
+                    "status": "FAIL",
                     "notes": ["track not present in SCP"],
                 }
             )
@@ -354,13 +422,15 @@ def qc_from_scp(
         if sectors_per_rotation and revs:
             expected_windows = sectors_per_rotation * revs
 
-        hole_interval = _hole_interval_stats(
-            rev.index_ticks for rev in track_data.revolutions
+        hole_interval = _hole_interval_metrics(
+            track_data.revolutions, sectors_per_rotation
         )
         revs_estimated = None
         if sectors_per_rotation:
             revs_estimated = (
-                windows_captured / sectors_per_rotation if sectors_per_rotation else None
+                windows_captured / sectors_per_rotation
+                if sectors_per_rotation
+                else None
             )
         anomalies = {"dropouts": 0, "noise": 0}
         if track_data.revolutions:
@@ -378,8 +448,11 @@ def qc_from_scp(
                 "windows_captured": windows_captured,
                 "expected_windows": expected_windows,
                 "hole_interval": hole_interval,
+                "hole_interval_cv_noindex": hole_interval.get("cv_noindex"),
+                "index_gap_ratio": hole_interval.get("index_gap_ratio"),
                 "revs_estimated": revs_estimated,
                 "anomalies": anomalies,
+                "status": "PASS",
                 "notes": [],
             }
         )
@@ -387,19 +460,23 @@ def qc_from_scp(
         if expected_windows and windows_captured is not None:
             if windows_captured < expected_windows * 0.9:
                 overall_status = _worse_status(overall_status, "WARN")
+                per_track_entries[-1]["status"] = "WARN"
                 missing_window_tracks.append(
                     (logical_track, windows_captured, expected_windows)
                 )
-        hole_interval_cv = hole_interval.get("cv")
+        hole_interval_cv = hole_interval.get("cv_noindex") or hole_interval.get("cv")
         if hole_interval_cv is not None:
             if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
                 overall_status = _worse_status(overall_status, "FAIL")
+                per_track_entries[-1]["status"] = "FAIL"
                 hole_interval_fail_tracks.append((logical_track, hole_interval_cv))
             elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
                 overall_status = _worse_status(overall_status, "WARN")
+                per_track_entries[-1]["status"] = "WARN"
                 hole_interval_warn_tracks.append((logical_track, hole_interval_cv))
         if anomalies["dropouts"] or anomalies["noise"]:
             overall_status = _worse_status(overall_status, "WARN")
+            per_track_entries[-1]["status"] = "WARN"
             anomaly_tracks.append((logical_track, anomalies))
 
     if missing_tracks:
@@ -429,13 +506,12 @@ def qc_from_scp(
         reason_summaries.append(f"Missing tracks: {missing_tracks}")
     if missing_window_tracks:
         reason_summaries.append(
-            "Missing captured windows on "
-            + f"{len(missing_window_tracks)} track(s)"
+            "Missing captured windows on " + f"{len(missing_window_tracks)} track(s)"
         )
     if hole_interval_fail_tracks or hole_interval_warn_tracks:
         affected = len(hole_interval_fail_tracks) + len(hole_interval_warn_tracks)
         reason_summaries.append(
-            f"hole_interval_cv elevated on {affected}/{len(tracks)} tracks (informational; based on hole-to-hole timing)"
+            f"hole timing jitter elevated on {affected}/{len(tracks)} track(s)"
         )
     if anomaly_tracks:
         top_anomalies = sorted(
@@ -444,8 +520,7 @@ def qc_from_scp(
             reverse=True,
         )
         top_desc = ", ".join(
-            f"T{track:02d}="
-            f"{issues.get('dropouts', 0) + issues.get('noise', 0)}"
+            f"T{track:02d}=" f"{issues.get('dropouts', 0) + issues.get('noise', 0)}"
             for track, issues in top_anomalies[:3]
         )
         reason_summaries.append(
@@ -454,9 +529,9 @@ def qc_from_scp(
         )
 
     scored = [
-        (entry, _capture_issue_score(entry))
+        (entry, _track_issue_score(entry, None))
         for entry in per_track_entries
-        if _capture_issue_score(entry) > 0
+        if _track_issue_score(entry, None) > 0
     ]
     scored.sort(key=lambda item: item[1], reverse=True)
     for entry, _ in scored[:3]:
@@ -471,9 +546,12 @@ def qc_from_scp(
                 f"dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)})"
             )
 
+    reason_payload = reason_summaries or (
+        ["all checks passed"] if overall_status == "PASS" else []
+    )
     report["overall"] = {
         "status": overall_status,
-        "reasons": reason_summaries or ["all checks passed"],
+        "reasons": reason_payload,
         "suggestions": suggestions,
     }
 
@@ -542,9 +620,10 @@ def _merge_overall(*reports: dict) -> dict:
         status = _worse_status(status, overall.get("status", "PASS"))
         reasons.extend(overall.get("reasons") or [])
         suggestions.extend(overall.get("suggestions") or [])
+    reason_payload = reasons or (["all checks passed"] if status == "PASS" else [])
     return {
         "status": status,
-        "reasons": reasons or ["all checks passed"],
+        "reasons": reason_payload,
         "suggestions": suggestions,
     }
 
@@ -604,8 +683,9 @@ def _run_reconstruction(
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
     try:
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-            stderr_buffer
+        with (
+            contextlib.redirect_stdout(stdout_buffer),
+            contextlib.redirect_stderr(stderr_buffer),
         ):
             reconstructor.run()
     except Exception:
@@ -688,9 +768,7 @@ def qc_capture(
         )
 
         cache_root.mkdir(parents=True, exist_ok=True)
-        output_dir, scp_hash = _cache_dir_for_run(
-            path, cache_root, params, scp_hash
-        )
+        output_dir, scp_hash = _cache_dir_for_run(path, cache_root, params, scp_hash)
         used_cache = False
 
         if reconstruct_out is not None:
@@ -738,7 +816,25 @@ def qc_capture(
             "scp_sha1": scp_hash,
             "params": params,
         }
-        combined["overall"] = _merge_overall(capture_report, recon_report)
+        combined_overall = _merge_overall(capture_report, recon_report)
+        capture_status = (capture_report.get("overall") or {}).get("status", "PASS")
+        recon_status = (recon_report.get("overall") or {}).get("status", "PASS")
+        if capture_status != "PASS" and recon_status == "PASS":
+            noisy_tracks = len(anomaly_tracks)
+            combined_reason = (
+                f"Reconstruction clean; capture shows minor flux noise on {noisy_tracks} track(s)."
+                if noisy_tracks
+                else "Reconstruction clean; capture warnings recorded."
+            )
+            combined_overall["reasons"] = [
+                combined_reason,
+                *[
+                    r
+                    for r in combined_overall.get("reasons", [])
+                    if r != "all checks passed"
+                ],
+            ]
+        combined["overall"] = combined_overall
         return combined
 
     if path.is_dir() and (path / "manifest.json").exists():
@@ -747,265 +843,285 @@ def qc_capture(
     raise ValueError("input must be an .scp file or reconstruction output directory")
 
 
-def _capture_issue_score(entry: dict) -> int:
-    anomalies = entry.get("anomalies") or {}
-    dropouts = int(anomalies.get("dropouts") or 0)
+def _track_issue_score(capture_entry: dict | None, recon_entry: dict | None) -> int:
+    recon_missing = len(recon_entry.get("missing_sectors") or []) if recon_entry else 0
+    crc_fail = int(recon_entry.get("crc_fail") or 0) if recon_entry else 0
+    no_decode = int(recon_entry.get("no_decode") or 0) if recon_entry else 0
+    low_conf = int(recon_entry.get("low_confidence") or 0) if recon_entry else 0
+    anomalies = (capture_entry.get("anomalies") or {}) if capture_entry else {}
     noise = int(anomalies.get("noise") or 0)
-    windows_captured = entry.get("windows_captured") or 0
-    expected_windows = entry.get("expected_windows")
-    missing_windows = (
-        max(expected_windows - windows_captured, 0)
-        if expected_windows is not None
-        else 0
+    dropouts = int(anomalies.get("dropouts") or 0)
+    hole_interval = (capture_entry or {}).get("hole_interval") or {}
+    hole_interval_cv = (capture_entry or {}).get(
+        "hole_interval_cv_noindex"
+    ) or hole_interval.get("cv")
+    timing_warn = (
+        hole_interval_cv is not None
+        and hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD
     )
-    hole_interval = entry.get("hole_interval") or {}
-    hole_interval_cv = hole_interval.get("cv")
-    jitter_score = 0
-    if hole_interval_cv is not None:
-        if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
-            jitter_score = 5
-        elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
-            jitter_score = 1
 
-    return dropouts * 3 + noise * 2 + jitter_score + missing_windows * 4
-
-
-def _reconstruction_issue_score(entry: dict) -> int:
-    missing = len(entry.get("missing_sectors") or [])
-    crc_fail = int(entry.get("crc_fail") or 0)
-    no_decode = int(entry.get("no_decode") or 0)
-    low_conf = int(entry.get("low_confidence") or 0)
-    return missing * 5 + no_decode * 3 + crc_fail + low_conf
+    return (
+        100 * recon_missing
+        + 50 * no_decode
+        + 10 * crc_fail
+        + 2 * low_conf
+        + noise
+        + dropouts
+        + (5 if timing_warn else 0)
+    )
 
 
-def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool = True) -> str:
-    lines: list[str] = []
-    if include_summary:
-        lines.extend([summarize_qc(report), ""])
-    lines.append("Capture QC:")
-    capture = report.get("capture_qc") or {}
-    present_tracks = capture.get("present_tracks") or []
-    missing_tracks = capture.get("missing_tracks") or []
-    tracks = capture.get("per_track") or report.get("per_track") or []
-    window_counts = [
-        entry.get("windows_captured")
-        for entry in tracks
-        if entry.get("windows_captured") is not None
-    ]
-    window_desc = "unknown"
-    if window_counts:
-        window_desc = (
-            f"{int(min(window_counts))}/{statistics.median(window_counts):.1f}/"
-            f"{int(max(window_counts))}"
+def _build_track_maps(report: dict) -> tuple[dict[int, dict], dict[int, dict]]:
+    capture_entries = report.get("capture_per_track") or report.get("per_track") or []
+    recon_entries = report.get("reconstruction_per_track") or []
+    capture_map = {
+        int(entry.get("track")): entry for entry in capture_entries if "track" in entry
+    }
+    recon_map = {
+        int(entry.get("track")): entry for entry in recon_entries if "track" in entry
+    }
+    return capture_map, recon_map
+
+
+def _top_issue_tracks(
+    report: dict, limit: int = 5
+) -> list[tuple[int, int, dict | None, dict | None]]:
+    capture_map, recon_map = _build_track_maps(report)
+    track_ids = sorted(set(capture_map.keys()) | set(recon_map.keys()))
+    scored: list[tuple[int, int, dict | None, dict | None]] = []
+    for track_id in track_ids:
+        capture_entry = capture_map.get(track_id)
+        recon_entry = recon_map.get(track_id)
+        score = _track_issue_score(capture_entry, recon_entry)
+        if score > 0:
+            scored.append((track_id, score, capture_entry, recon_entry))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[:limit]
+
+
+def _format_capture_detail_lines(
+    capture: dict, *, status_only: bool = False
+) -> list[str]:
+    tracks = capture.get("per_track") or []
+    lines: list[str] = ["Capture QC (per track):"]
+    if not tracks:
+        lines.append("  (no capture data)")
+        return lines
+
+    for entry in tracks:
+        anomalies = entry.get("anomalies") or {}
+        scp_track = entry.get("scp_track_id")
+        scp_note = f" (scp={scp_track})" if scp_track is not None else ""
+        expected_windows = entry.get("expected_windows")
+        window_desc = "unknown"
+        if expected_windows is not None:
+            window_desc = f"{entry.get('windows_captured') or 0}/{expected_windows}"
+        elif entry.get("windows_captured") is not None:
+            window_desc = str(entry.get("windows_captured"))
+        hole_cv = entry.get("hole_interval_cv_noindex")
+        if hole_cv is None:
+            hole_cv = (entry.get("hole_interval") or {}).get("cv")
+        hole_note = (
+            f"hole_cv_noindex={hole_cv:.3f}"
+            if hole_cv is not None
+            else "hole_cv_noindex=n/a"
         )
-    holes_per_rotation = capture.get("holes_per_rotation_effective") or capture.get(
-        "sectors_per_rotation"
-    )
-    revs_estimated_vals = [
-        entry.get("revs_estimated")
-        for entry in tracks
-        if entry.get("revs_estimated") is not None
-    ]
-    revs_estimated_desc = (
-        f"{statistics.median(revs_estimated_vals):.2f}"
-        if revs_estimated_vals
-        else "unknown"
-    )
-    lines.append(
-        "  "
-        + f"tracks present={len(present_tracks)} missing={len(missing_tracks)} "
-        + f"windows_captured={window_desc} holes_per_rotation={holes_per_rotation} "
-        + f"revs_estimated={revs_estimated_desc} revs_requested={capture.get('revs_requested')}"
-    )
+        index_gap = entry.get("index_gap_ratio")
+        gap_note = (
+            f"index_gap_ratio={index_gap:.2f}"
+            if index_gap is not None
+            else "index_gap_ratio=n/a"
+        )
+        status = entry.get("status") or "PASS"
+        line = (
+            f"  T{int(entry.get('track', -1)):02d}{scp_note}: windows={window_desc} "
+            f"{gap_note} {hole_note} noise={anomalies.get('noise', 0)} "
+            f"dropouts={anomalies.get('dropouts', 0)} status={status}"
+        )
+        notes = entry.get("notes") or []
+        if notes and not status_only:
+            line += f" notes={' | '.join(notes)}"
+        lines.append(line)
+    return lines
 
-    scored = [entry for entry in tracks if _capture_issue_score(entry) > 0]
-    scored.sort(key=_capture_issue_score, reverse=True)
-    lines.append("Top affected tracks:")
-    if not scored:
-        lines.append("  No affected tracks detected.")
-    else:
-        for entry in scored[:limit]:
-            windows_captured = entry.get("windows_captured")
-            expected_windows = entry.get("expected_windows")
-            window_desc = "unknown"
-            missing_windows = 0
-            if expected_windows is not None:
-                window_desc = f"{windows_captured or 0}/{expected_windows}"
-                missing_windows = max(expected_windows - (windows_captured or 0), 0)
-            elif windows_captured is not None:
-                window_desc = str(windows_captured)
 
-            hole_interval = entry.get("hole_interval") or {}
-            hole_interval_cv = hole_interval.get("cv")
-            hole_note = "n/a"
-            if hole_interval_cv is not None:
-                if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (FAIL)"
-                elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (WARN)"
-                else:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f}"
-            anomalies = entry.get("anomalies") or {}
-            scp_track = entry.get("scp_track_id")
-            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
+def _format_reconstruction_detail_lines(
+    recon: dict, failure_cap: int = 200
+) -> list[str]:
+    per_track = recon.get("per_track") or []
+    lines = ["Reconstruction QC (per track):"]
+    if not per_track:
+        lines.append("  (no reconstruction data)")
+        return lines
+
+    for entry in per_track:
+        missing = len(entry.get("missing_sectors") or [])
+        line = (
+            f"  T{int(entry.get('track', -1)):02d}: sectors={entry.get('sectors_present', 0)}/"
+            f"{entry.get('sectors_expected')} missing={missing} crc_fail={entry.get('crc_fail', 0)} "
+            f"no_decode={entry.get('no_decode', 0)} low_conf={entry.get('low_confidence', 0)}"
+        )
+        lines.append(line)
+
+    failures = recon.get("per_sector_failures") or []
+    if failures:
+        lines.append("Sector failures:")
+        for entry in failures[:failure_cap]:
             lines.append(
-                "  "
-                + f"T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
-                + f"hole_interval={hole_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
+                f"  T{int(entry.get('track', -1)):02d} S{int(entry.get('sector', -1)):02d} "
+                f"{entry.get('status', '').upper()} = {entry.get('code', entry.get('status'))}"
+                + (f" ({entry.get('detail')})" if entry.get("detail") else "")
             )
+        if len(failures) > failure_cap:
+            lines.append(f"  ...and {len(failures) - failure_cap} more")
+    return lines
 
-    if report.get("mode") == "detail" and tracks:
-        lines.append("Details:")
-        for entry in tracks:
-            anomalies = entry.get("anomalies") or {}
-            hole_interval = entry.get("hole_interval") or {}
-            hole_interval_cv = hole_interval.get("cv")
-            hole_note = "hole_interval_cv=n/a"
-            if hole_interval_cv is not None:
-                if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (FAIL)"
-                elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (WARN)"
-                else:
-                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f}"
-            windows_captured = entry.get("windows_captured")
-            expected_windows = entry.get("expected_windows")
-            missing_windows = 0
-            window_desc = "unknown"
-            if expected_windows is not None:
-                missing_windows = max(expected_windows - (windows_captured or 0), 0)
-                window_desc = f"{windows_captured or 0}/{expected_windows}"
-            elif windows_captured is not None:
-                window_desc = str(windows_captured)
 
-            scp_track = entry.get("scp_track_id")
-            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
-            detail_line = (
-                f"  T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
-                f"{hole_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
-            )
-            notes = entry.get("notes") or []
-            if notes:
-                detail_line += f" notes={' | '.join(notes)}"
-            lines.append(detail_line)
-
-    lines.extend(
-        [
-            "",
-            "Capture legend:",
-            "  windows_captured: number of captured hole-to-hole windows",
-            "  expected_windows: sectors_per_rotation * revs (if supplied/known)",
-            "  hole_interval_cv: stdev(window_duration) / mean(window_duration)",
-            "  dropouts: windows with unusually long gaps (potential weak signal)",
-            "  noise: windows with unusually many very short intervals (noisy signal)",
-        ]
+def _summarize_reconstruction_line(report: dict) -> str:
+    recon = report.get("reconstruction_qc") or {}
+    if not recon:
+        return "Reconstruction: not run"
+    expected = recon.get("expected_sectors")
+    written = recon.get("written_sectors")
+    missing = len(recon.get("missing_sectors") or [])
+    crc_fail = recon.get("crc_fail_count", 0)
+    no_decode = recon.get("no_decode_count", 0)
+    low_conf = recon.get("low_confidence_count", 0)
+    return (
+        "Reconstruction: "
+        + f"{written}/{expected} sectors, crc_fail={crc_fail}, "
+        + f"no_decode={no_decode}, missing={missing}, low_conf={low_conf}"
     )
-    return "\n".join(lines)
 
 
-def _reconstruction_top_tracks(report: dict) -> list[dict]:
-    tracks = report.get("per_track") or []
-    scored = [entry for entry in tracks if _reconstruction_issue_score(entry) > 0]
-    scored.sort(key=_reconstruction_issue_score, reverse=True)
-    return scored
-
-
-def _format_failure_entry(entry: dict) -> str:
-    status = (entry.get("status") or "").upper()
-    status = {"LOW_CONFIDENCE": "LOW_CONF", "UNREADABLE": "NO_DECODE"}.get(
-        status, status
+def _summarize_capture_line(report: dict) -> str:
+    capture = report.get("capture_qc") or {}
+    if not capture:
+        return "Capture: not run"
+    tracks = capture.get("per_track") or report.get("per_track") or []
+    present_count = len(tracks)
+    missing_tracks = len(capture.get("missing_tracks") or [])
+    windows_captured = sum(int(entry.get("windows_captured") or 0) for entry in tracks)
+    expected_list = [
+        entry.get("expected_windows")
+        for entry in tracks
+        if entry.get("expected_windows") is not None
+    ]
+    expected_total = sum(expected_list) if expected_list else None
+    anomalies = [entry.get("anomalies") or {} for entry in tracks]
+    noise_windows = sum(int(a.get("noise") or 0) for a in anomalies)
+    dropout_windows = sum(int(a.get("dropouts") or 0) for a in anomalies)
+    expected_str = str(expected_total) if expected_total is not None else "unknown"
+    return (
+        "Capture: "
+        + f"tracks present={present_count} missing={missing_tracks}, "
+        + f"windows={windows_captured}/{expected_str}, noise_windows={noise_windows}, "
+        + f"dropout_windows={dropout_windows}"
     )
-    return f"  T{int(entry.get('track', -1)):02d} S{int(entry.get('sector', -1)):02d}: {status}"
+
+
+def _format_top_issues_line(report: dict, limit: int = 5) -> str:
+    top_tracks = _top_issue_tracks(report, limit=limit)
+    if not top_tracks:
+        return "Top issues: No affected tracks detected."
+    formatted = []
+    for track_id, score, capture_entry, recon_entry in top_tracks:
+        missing = len((recon_entry or {}).get("missing_sectors") or [])
+        crc_fail = (recon_entry or {}).get("crc_fail", 0)
+        no_decode = (recon_entry or {}).get("no_decode", 0)
+        low_conf = (recon_entry or {}).get("low_confidence", 0)
+        anomalies = (capture_entry or {}).get("anomalies") or {}
+        timing_cv = (capture_entry or {}).get("hole_interval_cv_noindex")
+        timing_note = "" if timing_cv is None else f", timing_cv={timing_cv:.3f}"
+        formatted.append(
+            f"T{track_id:02d} (score={score}; missing={missing} no_decode={no_decode} crc_fail={crc_fail} "
+            f"low_conf={low_conf} noise={anomalies.get('noise', 0)} dropouts={anomalies.get('dropouts', 0)}{timing_note})"
+        )
+    return "Top issues: " + ", ".join(formatted)
 
 
 def format_reconstruction_report(
-    report: dict, limit: int = 5, failure_cap: int = 100, *, include_summary: bool = True
+    report: dict,
+    limit: int = 5,
+    failure_cap: int = 100,
+    *,
+    include_summary: bool = True,
 ) -> str:
     lines: list[str] = []
     if include_summary:
         lines.extend([summarize_qc(report), ""])
-    lines.append("Reconstruction QC:")
-    recon = report.get("reconstruction_qc") or {}
-    per_track = (
-        report.get("reconstruction_per_track")
-        or report.get("per_track")
-        or []
+    lines.append(_summarize_reconstruction_line(report))
+    recon_detail = dict(report.get("reconstruction_qc") or {})
+    recon_detail.setdefault(
+        "per_track",
+        report.get("reconstruction_per_track") or report.get("per_track") or [],
     )
-    missing_count = len(recon.get("missing_sectors") or [])
-    lines.append(
-        "  "
-        + f"tracks_present={len(per_track)} expected_sectors={recon.get('expected_sectors')} "
-        + f"written_sectors={recon.get('written_sectors')} missing_sectors={missing_count} "
-        + f"crc_fail={recon.get('crc_fail_count', 0)} no_decode={recon.get('no_decode_count', 0)}"
+    recon_detail.setdefault(
+        "per_sector_failures",
+        (report.get("reconstruction_qc") or {}).get("per_sector_failures")
+        or report.get("reconstruction_per_sector")
+        or report.get("per_sector")
+        or [],
     )
-
-    top_tracks = _reconstruction_top_tracks(report)
-    lines.append("Top affected tracks:")
-    if not top_tracks:
-        lines.append("  No affected tracks detected.")
-    else:
-        for entry in top_tracks[:limit]:
-            scp_track = entry.get("scp_track_id")
-            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
-            lines.append(
-                "  "
-                + f"T{entry.get('track'):02d}{scp_note}: missing={len(entry.get('missing_sectors') or [])} "
-                + f"crc_fail={entry.get('crc_fail', 0)} no_decode={entry.get('no_decode', 0)} low_conf={entry.get('low_confidence', 0)}"
-            )
-
-    if report.get("mode") == "detail":
-        failures = (
-            report.get("reconstruction_per_sector")
-            or report.get("per_sector")
-            or []
-        )
-        if failures:
-            lines.append("Failures:")
-            for entry in failures[:failure_cap]:
-                lines.append(_format_failure_entry(entry))
-            if len(failures) > failure_cap:
-                lines.append(f"  (+{len(failures) - failure_cap} more)")
-
     lines.extend(
-        [
-            "",
-            "Reconstruction legend:",
-            "  missing: sector file absent from sectors/ (incomplete reconstruction)",
-            "  crc_fail: sector decoded but failed integrity check (often marginal bits)",
-            "  no_decode: no consistent sector could be reconstructed (deeper issue)",
-            "  low_conf: reconstructed but low consensus (if supported)",
-        ]
+        _format_reconstruction_detail_lines(
+            recon_detail,
+            failure_cap=failure_cap,
+        )
     )
+    lines.append(_format_top_issues_line(report, limit=limit))
+    return "\n".join(lines)
+
+
+def format_capture_report(
+    report: dict, limit: int = 5, *, include_summary: bool = True
+) -> str:
+    lines: list[str] = []
+    if include_summary:
+        lines.extend([summarize_qc(report), ""])
+    lines.append(_summarize_capture_line(report))
+    lines.extend(_format_capture_detail_lines(report.get("capture_qc") or {}))
+    lines.append(_format_top_issues_line(report, limit=limit))
     return "\n".join(lines)
 
 
 def format_detail_summary(report: dict, limit: int = 5) -> str:
-    pipeline = report.get("pipeline") or []
-    if report.get("input", {}).get("type") == "scp" and "reconstruction_qc" in pipeline:
-        cache_note = report.get("reconstruct") or {}
-        cache_line = None
-        if cache_note.get("enabled"):
-            cache_line = (
-                "Reconstruction: reused cache at "
-                + str(cache_note.get("out_dir"))
-                if cache_note.get("used_cache")
-                else "Reconstruction: generated cache at " + str(cache_note.get("out_dir"))
-            )
-        lines: list[str] = []
-        lines.append(summarize_qc(report))
+    lines: list[str] = []
+    lines.append(summarize_qc(report))
+    lines.append(_summarize_reconstruction_line(report))
+    lines.append(_summarize_capture_line(report))
+    lines.append(_format_top_issues_line(report, limit=limit))
+
+    if report.get("mode") == "detail":
         lines.append("")
-        lines.extend(format_capture_report(report, limit=limit, include_summary=False).splitlines())
+        lines.extend(_format_capture_detail_lines(report.get("capture_qc") or {}))
         lines.append("")
-        recon_lines = format_reconstruction_report(
-            report, limit=limit, failure_cap=100, include_summary=False
-        ).splitlines()
-        lines.extend(recon_lines)
-        if cache_line:
-            lines.append(cache_line)
-        return "\n".join(lines)
-    if report.get("input", {}).get("type") == "scp":
-        return format_capture_report(report, limit=limit)
-    return format_reconstruction_report(report, limit=limit)
+        recon_detail = dict(report.get("reconstruction_qc") or {})
+        recon_detail.setdefault(
+            "per_track",
+            report.get("reconstruction_per_track") or report.get("per_track") or [],
+        )
+        recon_detail.setdefault(
+            "per_sector_failures",
+            (report.get("reconstruction_qc") or {}).get("per_sector_failures")
+            or report.get("reconstruction_per_sector")
+            or report.get("per_sector")
+            or [],
+        )
+        recon_section = _format_reconstruction_detail_lines(
+            recon_detail, failure_cap=200
+        )
+        lines.extend(recon_section)
+
+    cache_note = report.get("reconstruct") or {}
+    if cache_note.get("enabled"):
+        cache_line = (
+            "Reconstruction: reused cache at " + str(cache_note.get("out_dir"))
+            if cache_note.get("used_cache")
+            else "Reconstruction: generated cache at " + str(cache_note.get("out_dir"))
+        )
+        lines.append(cache_line)
+    return "\n".join(lines)
 
 
 def default_output_path(input_path: Path, report: dict) -> Path:
