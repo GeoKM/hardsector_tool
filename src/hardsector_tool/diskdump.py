@@ -730,10 +730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_path = args.out or qc.default_output_path(args.input, report)
         out_path.write_text(json.dumps(report, indent=2))
 
-        if args.mode == "detail":
-            print(qc.format_detail_summary(report))
-        else:
-            print(qc.summarize_qc(report))
+        print(qc.format_detail_summary(report))
         return 0
 
     parser.error(f"Unknown command {args.command}")
