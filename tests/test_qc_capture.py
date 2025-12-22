@@ -109,3 +109,64 @@ def test_qc_scp_missing_track(monkeypatch, tmp_path: Path) -> None:
 
     assert report["overall"]["status"] == "FAIL"
     assert 1 in report["capture_qc"]["missing_tracks"]
+
+
+def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) -> None:
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [SimpleNamespace(index_ticks=1000)]
+            self.revolution_count = len(self.revolutions)
+
+        def decode_flux(self, rev_index: int):
+            return [10, 80, 12, 14, 120]
+
+    class FakeImage:
+        def __init__(self) -> None:
+            self.header = SimpleNamespace(sides=1, revolutions=1)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls()
+
+        def list_present_tracks(self, side: int):
+            return [0]
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+
+    report = qc.qc_from_scp(tmp_path / "fake.scp", mode="detail", tracks=[0])
+    output = qc.format_detail_summary(report)
+
+    assert "windows=" in output
+    assert "crc_fail=" not in output
+    assert "no_decode=" not in output
+
+
+def test_reconstruction_failures_listed(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    sectors_dir = out_dir / "sectors"
+    tracks_dir = out_dir / "tracks"
+    sectors_dir.mkdir(parents=True)
+    tracks_dir.mkdir(parents=True)
+
+    manifest = {
+        "tracks": [
+            {"track_number": 0, "recovered_sectors": 1},
+        ],
+        "totals": {"expected_sectors": 2, "written_sectors": 1, "missing_sectors": 1},
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    tracks_dir.joinpath("T00.json").write_text(
+        json.dumps({"sectors": [{"sector_id": 0, "status": "CRC_FAIL"}]})
+    )
+    sectors_dir.joinpath("T00_S00.bin").write_bytes(b"ok")
+
+    report = qc.qc_from_outdir(out_dir, mode="detail")
+    output = qc.format_detail_summary(report)
+
+    assert "Failures:" in output
+    assert "T00 S00: CRC_FAIL" in output
+    assert "T00 S01: MISSING" in output
