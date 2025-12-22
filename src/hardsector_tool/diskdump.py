@@ -667,6 +667,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="[reconstruct] Skip reconstruction; capture QC only",
     )
     qc.add_argument(
+        "--reconstruct-verbose",
+        action="store_true",
+        help="[reconstruct] Show verbose reconstruction debug logs during qc-capture",
+    )
+    qc.add_argument(
         "--cache-dir",
         type=Path,
         default=Path(".qc_cache"),
@@ -827,6 +832,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 clock_factor=args.clock_factor,
                 dump_raw_windows=args.dump_raw_windows,
                 force=args.force,
+                reconstruct_verbose=args.reconstruct_verbose,
             )
         except ValueError as exc:
             parser.error(str(exc))

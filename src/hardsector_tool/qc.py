@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import statistics
+import sys
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -49,7 +52,8 @@ def _base_report(input_type: str, path: Path, mode: str) -> dict:
     }
 
 
-TIMING_CV_THRESHOLD = 0.02
+HOLE_INTERVAL_WARN_THRESHOLD = 0.25
+HOLE_INTERVAL_FAIL_THRESHOLD = 0.40
 
 
 def summarize_qc(report: dict) -> str:
@@ -259,7 +263,7 @@ def _flux_anomalies(flux: Sequence[int]) -> tuple[int, int]:
     return dropouts, noise
 
 
-def _timing_stats(values: Iterable[int]) -> dict:
+def _hole_interval_stats(values: Iterable[int]) -> dict:
     vals = list(values)
     if not vals:
         return {"mean": None, "stdev": None, "cv": None}
@@ -289,9 +293,12 @@ def qc_from_scp(
     report["pipeline"] = ["capture_qc"]
     missing_tracks: list[int] = []
     per_track_entries: list[dict] = []
-    reasons: list[str] = []
     suggestions: list[str] = []
     overall_status = "PASS"
+    hole_interval_warn_tracks: list[tuple[int, float]] = []
+    hole_interval_fail_tracks: list[tuple[int, float]] = []
+    anomaly_tracks: list[tuple[int, dict]] = []
+    missing_window_tracks: list[tuple[int, int, int]] = []
 
     for logical_track in tracks:
         try:
@@ -316,7 +323,8 @@ def qc_from_scp(
                     "used_fallback_track": False,
                     "windows_captured": 0,
                     "expected_windows": None,
-                    "timing": {"mean": None, "stdev": None, "cv": None},
+                    "hole_interval": {"mean": None, "stdev": None, "cv": None},
+                    "revs_estimated": None,
                     "anomalies": {"dropouts": 0, "noise": 0},
                     "notes": [str(exc)],
                 }
@@ -332,7 +340,8 @@ def qc_from_scp(
                     "track": logical_track,
                     "windows_captured": 0,
                     "expected_windows": None,
-                    "timing": {"mean": None, "stdev": None, "cv": None},
+                    "hole_interval": {"mean": None, "stdev": None, "cv": None},
+                    "revs_estimated": None,
                     "anomalies": {"dropouts": 0, "noise": 0},
                     "notes": ["track not present in SCP"],
                 }
@@ -340,61 +349,68 @@ def qc_from_scp(
             overall_status = _worse_status(overall_status, "FAIL")
             continue
 
-        observed_windows = None
-        if sectors_per_rotation:
-            observed_windows = sectors_per_rotation * track_data.revolution_count
+        windows_captured = track_data.revolution_count
         expected_windows = None
         if sectors_per_rotation and revs:
             expected_windows = sectors_per_rotation * revs
 
-        timing = _timing_stats(rev.index_ticks for rev in track_data.revolutions)
+        hole_interval = _hole_interval_stats(
+            rev.index_ticks for rev in track_data.revolutions
+        )
+        revs_estimated = None
+        if sectors_per_rotation:
+            revs_estimated = (
+                windows_captured / sectors_per_rotation if sectors_per_rotation else None
+            )
         anomalies = {"dropouts": 0, "noise": 0}
         if track_data.revolutions:
             flux_segment = track_data.decode_flux(0)
             anomalies["dropouts"], anomalies["noise"] = _flux_anomalies(flux_segment)
 
-            per_track_entries.append(
-                {
-                    "track": logical_track,
-                    "scp_track_id": scp_track_id,
-                    "expected_scp_track_id": expected_track_id,
-                    "track_mapping_mode": mapping_mode,
-                    "track_step": step,
-                    "used_fallback_track": used_fallback,
-                    "windows_captured": observed_windows,
-                    "expected_windows": expected_windows,
-                    "timing": timing,
-                    "anomalies": anomalies,
-                    "notes": [],
+        per_track_entries.append(
+            {
+                "track": logical_track,
+                "scp_track_id": scp_track_id,
+                "expected_scp_track_id": expected_track_id,
+                "track_mapping_mode": mapping_mode,
+                "track_step": step,
+                "used_fallback_track": used_fallback,
+                "windows_captured": windows_captured,
+                "expected_windows": expected_windows,
+                "hole_interval": hole_interval,
+                "revs_estimated": revs_estimated,
+                "anomalies": anomalies,
+                "notes": [],
             }
         )
 
-        if expected_windows and observed_windows is not None:
-            if observed_windows < expected_windows * 0.9:
+        if expected_windows and windows_captured is not None:
+            if windows_captured < expected_windows * 0.9:
                 overall_status = _worse_status(overall_status, "WARN")
-                reasons.append(
-                    f"Track {logical_track} captured {observed_windows} windows; expected {expected_windows}"
+                missing_window_tracks.append(
+                    (logical_track, windows_captured, expected_windows)
                 )
-        if timing.get("cv") is not None and timing["cv"] > TIMING_CV_THRESHOLD:
-            overall_status = _worse_status(overall_status, "WARN")
-            reasons.append(
-                f"Track {logical_track} shows high revolution jitter (cv={timing['cv']:.2f})"
-            )
+        hole_interval_cv = hole_interval.get("cv")
+        if hole_interval_cv is not None:
+            if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
+                overall_status = _worse_status(overall_status, "FAIL")
+                hole_interval_fail_tracks.append((logical_track, hole_interval_cv))
+            elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
+                overall_status = _worse_status(overall_status, "WARN")
+                hole_interval_warn_tracks.append((logical_track, hole_interval_cv))
         if anomalies["dropouts"] or anomalies["noise"]:
             overall_status = _worse_status(overall_status, "WARN")
-            reasons.append(
-                f"Track {logical_track} has flux anomalies (dropouts={anomalies['dropouts']}, noise={anomalies['noise']})"
-            )
+            anomaly_tracks.append((logical_track, anomalies))
 
     if missing_tracks:
         overall_status = _worse_status(overall_status, "FAIL")
-        reasons.append(f"Missing tracks: {missing_tracks}")
         suggestions.append("verify capture head/side selection and track range")
 
     capture_qc = {
         "present_tracks": present_tracks,
         "missing_tracks": missing_tracks,
         "sectors_per_rotation": sectors_per_rotation,
+        "holes_per_rotation_effective": sectors_per_rotation,
         "revs_requested": revs,
         "params": {
             "tracks": list(tracks),
@@ -407,9 +423,57 @@ def qc_from_scp(
     }
 
     report["capture_qc"] = capture_qc
+    reason_summaries: list[str] = []
+
+    if missing_tracks:
+        reason_summaries.append(f"Missing tracks: {missing_tracks}")
+    if missing_window_tracks:
+        reason_summaries.append(
+            "Missing captured windows on "
+            + f"{len(missing_window_tracks)} track(s)"
+        )
+    if hole_interval_fail_tracks or hole_interval_warn_tracks:
+        affected = len(hole_interval_fail_tracks) + len(hole_interval_warn_tracks)
+        reason_summaries.append(
+            f"hole_interval_cv elevated on {affected}/{len(tracks)} tracks (informational; based on hole-to-hole timing)"
+        )
+    if anomaly_tracks:
+        top_anomalies = sorted(
+            anomaly_tracks,
+            key=lambda item: item[1].get("dropouts", 0) + item[1].get("noise", 0),
+            reverse=True,
+        )
+        top_desc = ", ".join(
+            f"T{track:02d}="
+            f"{issues.get('dropouts', 0) + issues.get('noise', 0)}"
+            for track, issues in top_anomalies[:3]
+        )
+        reason_summaries.append(
+            f"Noise/dropout anomalies on {len(anomaly_tracks)} track(s)"
+            + (f" (top: {top_desc})" if top_desc else "")
+        )
+
+    scored = [
+        (entry, _capture_issue_score(entry))
+        for entry in per_track_entries
+        if _capture_issue_score(entry) > 0
+    ]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    for entry, _ in scored[:3]:
+        if mode == "brief":
+            anomalies = entry.get("anomalies") or {}
+            missing = 0
+            expected = entry.get("expected_windows")
+            if expected is not None:
+                missing = max(expected - (entry.get("windows_captured") or 0), 0)
+            reason_summaries.append(
+                f"Track {entry.get('track')} anomalous (missing_windows={missing} "
+                f"dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)})"
+            )
+
     report["overall"] = {
         "status": overall_status,
-        "reasons": reasons or ["all checks passed"],
+        "reasons": reason_summaries or ["all checks passed"],
         "suggestions": suggestions,
     }
 
@@ -485,12 +549,36 @@ def _merge_overall(*reports: dict) -> dict:
     }
 
 
+def _apply_capture_expectations(
+    capture_qc: dict, *, holes_per_rotation: int | None, revs: int | None
+) -> None:
+    if not capture_qc:
+        return
+    if holes_per_rotation is not None:
+        capture_qc["holes_per_rotation_effective"] = holes_per_rotation
+
+    for entry in capture_qc.get("per_track") or []:
+        if (
+            holes_per_rotation is not None
+            and entry.get("revs_estimated") is None
+            and entry.get("windows_captured") is not None
+        ):
+            entry["revs_estimated"] = entry.get("windows_captured") / holes_per_rotation
+        if (
+            holes_per_rotation is not None
+            and revs is not None
+            and entry.get("expected_windows") is None
+        ):
+            entry["expected_windows"] = holes_per_rotation * revs
+
+
 def _run_reconstruction(
     scp_path: Path,
     output_dir: Path,
     params: dict,
     *,
     force: bool,
+    verbose: bool = True,
 ) -> None:
     reconstructor = DiskReconstructor(
         image_path=scp_path,
@@ -509,7 +597,21 @@ def _run_reconstruction(
         force=force,
         track_step=params["track_step"],
     )
-    reconstructor.run()
+    if verbose:
+        reconstructor.run()
+        return
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+            stderr_buffer
+        ):
+            reconstructor.run()
+    except Exception:
+        sys.stderr.write(stdout_buffer.getvalue())
+        sys.stderr.write(stderr_buffer.getvalue())
+        raise
 
 
 def qc_capture(
@@ -533,6 +635,7 @@ def qc_capture(
     clock_factor: float = 1.0,
     dump_raw_windows: bool = False,
     force: bool = False,
+    reconstruct_verbose: bool = False,
 ) -> dict:
     path = Path(input_path)
     cache_root = Path(cache_dir) if cache_dir is not None else Path(".qc_cache")
@@ -545,6 +648,11 @@ def qc_capture(
             side=side,
             track_step=track_step,
             sectors_per_rotation=sectors_per_rotation,
+            revs=revs,
+        )
+        _apply_capture_expectations(
+            capture_report.get("capture_qc") or {},
+            holes_per_rotation=sectors_per_rotation,
             revs=revs,
         )
         use_reconstruct = reconstruct is not False
@@ -599,9 +707,16 @@ def qc_capture(
                 output_dir,
                 params,
                 force=force or force_reconstruct or output_dir.exists(),
+                verbose=reconstruct_verbose,
             )
 
         recon_report = qc_from_outdir(output_dir, mode=mode)
+        effective_holes = sectors_per_rotation or recon_sectors_per_rotation
+        _apply_capture_expectations(
+            capture_report.get("capture_qc") or {},
+            holes_per_rotation=effective_holes,
+            revs=revs,
+        )
         combined = _base_report("scp", path, mode)
         combined["pipeline"] = ["capture_qc", "reconstruct", "reconstruction_qc"]
         combined["capture_qc"] = capture_report.get("capture_qc")
@@ -643,11 +758,16 @@ def _capture_issue_score(entry: dict) -> int:
         if expected_windows is not None
         else 0
     )
-    timing = entry.get("timing") or {}
-    timing_cv = timing.get("cv")
-    jitter_flag = timing_cv is not None and timing_cv > TIMING_CV_THRESHOLD
+    hole_interval = entry.get("hole_interval") or {}
+    hole_interval_cv = hole_interval.get("cv")
+    jitter_score = 0
+    if hole_interval_cv is not None:
+        if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
+            jitter_score = 5
+        elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
+            jitter_score = 1
 
-    return dropouts * 3 + noise * 2 + (5 if jitter_flag else 0) + missing_windows * 4
+    return dropouts * 3 + noise * 2 + jitter_score + missing_windows * 4
 
 
 def _reconstruction_issue_score(entry: dict) -> int:
@@ -666,11 +786,38 @@ def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool
     capture = report.get("capture_qc") or {}
     present_tracks = capture.get("present_tracks") or []
     missing_tracks = capture.get("missing_tracks") or []
+    tracks = capture.get("per_track") or report.get("per_track") or []
+    window_counts = [
+        entry.get("windows_captured")
+        for entry in tracks
+        if entry.get("windows_captured") is not None
+    ]
+    window_desc = "unknown"
+    if window_counts:
+        window_desc = (
+            f"{int(min(window_counts))}/{statistics.median(window_counts):.1f}/"
+            f"{int(max(window_counts))}"
+        )
+    holes_per_rotation = capture.get("holes_per_rotation_effective") or capture.get(
+        "sectors_per_rotation"
+    )
+    revs_estimated_vals = [
+        entry.get("revs_estimated")
+        for entry in tracks
+        if entry.get("revs_estimated") is not None
+    ]
+    revs_estimated_desc = (
+        f"{statistics.median(revs_estimated_vals):.2f}"
+        if revs_estimated_vals
+        else "unknown"
+    )
     lines.append(
-        f"  tracks present={len(present_tracks)} missing={len(missing_tracks)} sectors_per_rotation={capture.get('sectors_per_rotation')} revs_requested={capture.get('revs_requested')}"
+        "  "
+        + f"tracks present={len(present_tracks)} missing={len(missing_tracks)} "
+        + f"windows_captured={window_desc} holes_per_rotation={holes_per_rotation} "
+        + f"revs_estimated={revs_estimated_desc} revs_requested={capture.get('revs_requested')}"
     )
 
-    tracks = capture.get("per_track") or report.get("per_track") or []
     scored = [entry for entry in tracks if _capture_issue_score(entry) > 0]
     scored.sort(key=_capture_issue_score, reverse=True)
     lines.append("Top affected tracks:")
@@ -688,39 +835,39 @@ def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool
             elif windows_captured is not None:
                 window_desc = str(windows_captured)
 
-            timing = entry.get("timing") or {}
-            timing_cv = timing.get("cv")
-            timing_note = "n/a"
-            if timing_cv is not None:
-                timing_note = (
-                    f"cv={timing_cv:.3f} (WARN)"
-                    if timing_cv > TIMING_CV_THRESHOLD
-                    else f"cv={timing_cv:.3f}"
-                )
+            hole_interval = entry.get("hole_interval") or {}
+            hole_interval_cv = hole_interval.get("cv")
+            hole_note = "n/a"
+            if hole_interval_cv is not None:
+                if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (FAIL)"
+                elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (WARN)"
+                else:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f}"
             anomalies = entry.get("anomalies") or {}
             scp_track = entry.get("scp_track_id")
             scp_note = f" (scp={scp_track})" if scp_track is not None else ""
             lines.append(
                 "  "
                 + f"T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
-                + f"timing={timing_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
+                + f"hole_interval={hole_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
             )
 
     if report.get("mode") == "detail" and tracks:
         lines.append("Details:")
         for entry in tracks:
             anomalies = entry.get("anomalies") or {}
-            timing = entry.get("timing") or {}
-            timing_cv = timing.get("cv")
-            timing_note = (
-                f"timing_cv={timing_cv:.3f} (WARN)"
-                if timing_cv and timing_cv > TIMING_CV_THRESHOLD
-                else (
-                    f"timing_cv={timing_cv:.3f}"
-                    if timing_cv is not None
-                    else "timing_cv=n/a"
-                )
-            )
+            hole_interval = entry.get("hole_interval") or {}
+            hole_interval_cv = hole_interval.get("cv")
+            hole_note = "hole_interval_cv=n/a"
+            if hole_interval_cv is not None:
+                if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (FAIL)"
+                elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f} (WARN)"
+                else:
+                    hole_note = f"hole_interval_cv={hole_interval_cv:.3f}"
             windows_captured = entry.get("windows_captured")
             expected_windows = entry.get("expected_windows")
             missing_windows = 0
@@ -735,7 +882,7 @@ def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool
             scp_note = f" (scp={scp_track})" if scp_track is not None else ""
             detail_line = (
                 f"  T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
-                f"{timing_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
+                f"{hole_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
             )
             notes = entry.get("notes") or []
             if notes:
@@ -748,7 +895,7 @@ def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool
             "Capture legend:",
             "  windows_captured: number of captured hole-to-hole windows",
             "  expected_windows: sectors_per_rotation * revs (if supplied/known)",
-            "  timing_cv: stdev(window_duration) / mean(window_duration)",
+            "  hole_interval_cv: stdev(window_duration) / mean(window_duration)",
             "  dropouts: windows with unusually long gaps (potential weak signal)",
             "  noise: windows with unusually many very short intervals (noisy signal)",
         ]
