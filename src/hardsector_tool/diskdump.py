@@ -650,6 +650,79 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="conservative",
         help="Failure threshold presets (reserved for future use)",
     )
+    qc.add_argument(
+        "--reconstruct",
+        dest="reconstruct",
+        action="store_true",
+        help="Enable reconstruction pass for SCP inputs (default)",
+    )
+    qc.add_argument(
+        "--no-reconstruct",
+        dest="reconstruct",
+        action="store_false",
+        help="Skip reconstruction; capture QC only",
+    )
+    qc.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".qc_cache"),
+        help="Cache directory for reconstruction outputs",
+    )
+    qc.add_argument(
+        "--force-reconstruct",
+        action="store_true",
+        help="Ignore cache and rerun reconstruction",
+    )
+    qc.add_argument(
+        "--reconstruct-out",
+        type=Path,
+        help="Write reconstruction output to this directory instead of cache",
+    )
+    qc.add_argument(
+        "--logical-sectors",
+        type=int,
+        default=16,
+        help="Logical sectors per track for reconstruction",
+    )
+    qc.add_argument(
+        "--reconstruct-sectors-per-rotation",
+        type=int,
+        default=None,
+        help="Hard-sector holes per rotation for reconstruction",
+    )
+    qc.add_argument(
+        "--sector-sizes",
+        default="auto",
+        help="Comma-separated sector sizes to try for reconstruction",
+    )
+    qc.add_argument(
+        "--keep-best",
+        type=int,
+        default=3,
+        help="Number of rotations to keep when reconstructing",
+    )
+    qc.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.80,
+        help="Similarity threshold for rotation consensus",
+    )
+    qc.add_argument(
+        "--clock-factor",
+        type=float,
+        default=1.0,
+        help="Clock factor passed to Wang reconstruction",
+    )
+    qc.add_argument(
+        "--dump-raw-windows",
+        action="store_true",
+        help="Dump decoded window bytes for debugging (reconstruction)",
+    )
+    qc.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting a reconstruction output directory",
+    )
 
     return parser
 
@@ -714,6 +787,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         from . import qc
 
         track_list = _parse_track_range(args.tracks) if args.tracks else None
+        sector_sizes = _parse_sector_sizes(args.sector_sizes)
+        recon_spr = (
+            args.reconstruct_sectors_per_rotation
+            if args.reconstruct_sectors_per_rotation is not None
+            else args.sectors_per_rotation
+            if args.sectors_per_rotation is not None
+            else 32
+        )
         try:
             report = qc.qc_capture(
                 args.input,
@@ -723,6 +804,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 track_step=args.track_step,
                 sectors_per_rotation=args.sectors_per_rotation,
                 revs=args.revs,
+                reconstruct=args.reconstruct,
+                cache_dir=args.cache_dir,
+                force_reconstruct=args.force_reconstruct,
+                reconstruct_out=args.reconstruct_out,
+                logical_sectors=args.logical_sectors,
+                recon_sectors_per_rotation=recon_spr,
+                sector_sizes=sector_sizes,
+                keep_best=args.keep_best,
+                similarity_threshold=args.similarity_threshold,
+                clock_factor=args.clock_factor,
+                dump_raw_windows=args.dump_raw_windows,
+                force=args.force,
             )
         except ValueError as exc:
             parser.error(str(exc))
