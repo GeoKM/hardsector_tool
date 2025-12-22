@@ -170,3 +170,114 @@ def test_reconstruction_failures_listed(tmp_path: Path) -> None:
     assert "Failures:" in output
     assert "T00 S00: CRC_FAIL" in output
     assert "T00 S01: MISSING" in output
+
+
+def _write_minimal_recon_out(out_dir: Path) -> None:
+    sectors_dir = out_dir / "sectors"
+    tracks_dir = out_dir / "tracks"
+    sectors_dir.mkdir(parents=True, exist_ok=True)
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "tracks": [{"track_number": 0, "recovered_sectors": 1}],
+        "totals": {"expected_sectors": 1, "written_sectors": 1, "missing_sectors": 0},
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    tracks_dir.joinpath("T00.json").write_text(json.dumps({"sectors": [{"sector_id": 0}]}))
+    sectors_dir.joinpath("T00_S00.bin").write_bytes(b"ok")
+
+
+def test_qc_capture_pipeline_uses_cache(monkeypatch, tmp_path: Path) -> None:
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [SimpleNamespace(index_ticks=1000)]
+            self.revolution_count = 1
+
+        def decode_flux(self, rev_index: int):
+            return [10, 11, 12]
+
+    class FakeImage:
+        def __init__(self) -> None:
+            self.header = SimpleNamespace(sides=1, revolutions=1)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls()
+
+        def list_present_tracks(self, side: int):
+            return [0]
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    runs: list[Path] = []
+
+    class FakeReconstructor:
+        def __init__(self, *, output_dir: Path, **_: object) -> None:
+            self.output_dir = output_dir
+
+        def run(self) -> None:
+            runs.append(self.output_dir)
+            _write_minimal_recon_out(self.output_dir)
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+    monkeypatch.setattr(qc, "DiskReconstructor", FakeReconstructor)
+
+    scp_path = tmp_path / "image.scp"
+    scp_path.write_bytes(b"data")
+
+    report = qc.qc_capture(scp_path, mode="detail", tracks=[0])
+
+    assert report["pipeline"] == ["capture_qc", "reconstruct", "reconstruction_qc"]
+    assert report["reconstruct"]["used_cache"] is False
+    assert report["reconstruction_qc"] is not None
+    assert runs
+
+    # Second run should reuse cache without invoking reconstructor again
+    report_cached = qc.qc_capture(scp_path, mode="detail", tracks=[0])
+
+    assert report_cached["reconstruct"]["used_cache"] is True
+    assert len(runs) == 1
+    assert "Reconstruction: reused cache" in qc.format_detail_summary(report_cached)
+
+
+def test_qc_capture_no_reconstruct(monkeypatch, tmp_path: Path) -> None:
+    class FakeImage:
+        def __init__(self) -> None:
+            self.header = SimpleNamespace(sides=1, revolutions=1)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls()
+
+        def list_present_tracks(self, side: int):
+            return [0]
+
+        def read_track(self, track_number: int):
+            return SimpleNamespace(
+                revolutions=[SimpleNamespace(index_ticks=1000)],
+                revolution_count=1,
+                decode_flux=lambda _: [10, 11, 12],
+            )
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+
+    scp_path = tmp_path / "image.scp"
+    scp_path.write_bytes(b"data")
+
+    report = qc.qc_capture(scp_path, reconstruct=False, tracks=[0])
+
+    assert report["reconstruction_qc"] is None
+    assert report["pipeline"] == ["capture_qc"]
+    output = qc.format_detail_summary(report)
+    assert "Reconstruction QC" not in output
+
+
+def test_qc_capture_out_dir_pipeline(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    _write_minimal_recon_out(out_dir)
+
+    report = qc.qc_capture(out_dir, mode="brief")
+
+    assert report["pipeline"] == ["reconstruction_qc"]
+    assert report.get("reconstruct", {}).get("enabled") is False

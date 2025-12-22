@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import statistics
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .diskdump import map_logical_to_scp_track_id
+from .diskdump import _parse_sector_sizes
+
+from .diskdump import DiskReconstructor, map_logical_to_scp_track_id
 from .scp import SCPImage
 
 QC_VERSION = 1
@@ -20,6 +23,14 @@ def _worse_status(current: str, candidate: str) -> str:
     return candidate if _STATUS_ORDER[candidate] > _STATUS_ORDER[current] else current
 
 
+def _hash_file(path: Path) -> str:
+    hasher = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def _base_report(input_type: str, path: Path, mode: str) -> dict:
     return {
         "tool": "hardsector_tool",
@@ -27,10 +38,14 @@ def _base_report(input_type: str, path: Path, mode: str) -> dict:
         "input": {"type": input_type, "path": str(path)},
         "mode": mode,
         "overall": {"status": "PASS", "reasons": [], "suggestions": []},
+        "pipeline": [],
+        "reconstruct": None,
         "capture_qc": None,
         "reconstruction_qc": None,
         "per_track": [],
         "per_sector": [],
+        "reconstruction_per_track": [],
+        "reconstruction_per_sector": [],
     }
 
 
@@ -76,6 +91,8 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
     out_dir = Path(out_dir)
     manifest_path = out_dir / "manifest.json"
     report = _base_report("out_dir", out_dir, mode)
+    report["pipeline"] = ["reconstruction_qc"]
+    report["reconstruct"] = {"enabled": False, "out_dir": str(out_dir)}
 
     if not manifest_path.exists():
         report["overall"] = {
@@ -126,6 +143,11 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
 
         entry = {
             "track": track_number,
+            "scp_track_id": track_entry.get("scp_track_id"),
+            "expected_scp_track_id": track_entry.get("expected_scp_track_id"),
+            "track_mapping_mode": track_entry.get("track_mapping_mode"),
+            "track_step": track_entry.get("track_step"),
+            "used_fallback_track": track_entry.get("used_fallback_track"),
             "sectors_expected": expected,
             "sectors_present": recovered,
             "missing_sectors": [],
@@ -216,11 +238,13 @@ def qc_from_outdir(out_dir: Path, mode: str = "brief") -> dict:
     }
     report["reconstruction_qc"] = reconstruction_qc
     report["per_track"] = per_track_entries
+    report["reconstruction_per_track"] = per_track_entries
     if mode == "detail":
         bad_sectors = [
             {"track": t, "sector": s, "status": "MISSING"} for t, s in missing_sectors
         ]
         report["per_sector"] = bad_sectors + per_sector_entries
+        report["reconstruction_per_sector"] = bad_sectors + per_sector_entries
     return report
 
 
@@ -262,6 +286,7 @@ def qc_from_scp(
         tracks = list(range(0, 77))
 
     report = _base_report("scp", image_path, mode)
+    report["pipeline"] = ["capture_qc"]
     missing_tracks: list[int] = []
     per_track_entries: list[dict] = []
     reasons: list[str] = []
@@ -284,6 +309,11 @@ def qc_from_scp(
             per_track_entries.append(
                 {
                     "track": logical_track,
+                    "scp_track_id": None,
+                    "expected_scp_track_id": None,
+                    "track_mapping_mode": None,
+                    "track_step": None,
+                    "used_fallback_track": False,
                     "windows_captured": 0,
                     "expected_windows": None,
                     "timing": {"mean": None, "stdev": None, "cv": None},
@@ -323,14 +353,19 @@ def qc_from_scp(
             flux_segment = track_data.decode_flux(0)
             anomalies["dropouts"], anomalies["noise"] = _flux_anomalies(flux_segment)
 
-        per_track_entries.append(
-            {
-                "track": logical_track,
-                "windows_captured": observed_windows,
-                "expected_windows": expected_windows,
-                "timing": timing,
-                "anomalies": anomalies,
-                "notes": [],
+            per_track_entries.append(
+                {
+                    "track": logical_track,
+                    "scp_track_id": scp_track_id,
+                    "expected_scp_track_id": expected_track_id,
+                    "track_mapping_mode": mapping_mode,
+                    "track_step": step,
+                    "used_fallback_track": used_fallback,
+                    "windows_captured": observed_windows,
+                    "expected_windows": expected_windows,
+                    "timing": timing,
+                    "anomalies": anomalies,
+                    "notes": [],
             }
         )
 
@@ -361,6 +396,7 @@ def qc_from_scp(
         "missing_tracks": missing_tracks,
         "sectors_per_rotation": sectors_per_rotation,
         "revs_requested": revs,
+        "per_track": per_track_entries,
     }
 
     report["capture_qc"] = capture_qc
@@ -374,6 +410,101 @@ def qc_from_scp(
     return report
 
 
+def _normalize_reconstruct_params(
+    *,
+    tracks: Sequence[int],
+    side: int,
+    track_step: str | int,
+    logical_sectors: int,
+    sectors_per_rotation: int,
+    sector_sizes: Sequence[int] | None,
+    keep_best: int,
+    similarity_threshold: float,
+    clock_factor: float,
+    dump_raw_windows: bool,
+) -> dict:
+    return {
+        "tracks": list(tracks),
+        "side": side,
+        "track_step": str(track_step),
+        "logical_sectors": logical_sectors,
+        "sectors_per_rotation": sectors_per_rotation,
+        "sector_sizes": list(sector_sizes) if sector_sizes is not None else None,
+        "keep_best": keep_best,
+        "similarity_threshold": similarity_threshold,
+        "clock_factor": clock_factor,
+        "dump_raw_windows": dump_raw_windows,
+    }
+
+
+def _param_hash(params: dict) -> str:
+    payload = json.dumps(params, sort_keys=True, default=str).encode()
+    return hashlib.sha1(payload).hexdigest()
+
+
+def _cache_dir_for_run(
+    scp_path: Path, cache_root: Path, params: dict, scp_hash: str | None = None
+) -> tuple[Path, str]:
+    scp_hash = scp_hash or _hash_file(scp_path)
+    param_hash = _param_hash(params)
+    dir_name = f"{Path(scp_path).stem}_{scp_hash[:12]}_{param_hash[:8]}"
+    return cache_root / dir_name, scp_hash
+
+
+def _ensure_empty_dir(path: Path, allow_nonempty: bool) -> None:
+    if not path.exists():
+        return
+    if allow_nonempty:
+        return
+    if any(path.iterdir()):
+        raise FileExistsError(
+            f"Output directory {path} is not empty; use --force or --force-reconstruct"
+        )
+
+
+def _merge_overall(*reports: dict) -> dict:
+    status = "PASS"
+    reasons: list[str] = []
+    suggestions: list[str] = []
+    for rep in reports:
+        overall = rep.get("overall") or {}
+        status = _worse_status(status, overall.get("status", "PASS"))
+        reasons.extend(overall.get("reasons") or [])
+        suggestions.extend(overall.get("suggestions") or [])
+    return {
+        "status": status,
+        "reasons": reasons or ["all checks passed"],
+        "suggestions": suggestions,
+    }
+
+
+def _run_reconstruction(
+    scp_path: Path,
+    output_dir: Path,
+    params: dict,
+    *,
+    force: bool,
+) -> None:
+    reconstructor = DiskReconstructor(
+        image_path=scp_path,
+        output_dir=output_dir,
+        tracks=params["tracks"],
+        side=params["side"],
+        logical_sectors=params["logical_sectors"],
+        sectors_per_rotation=params["sectors_per_rotation"],
+        sector_sizes=params["sector_sizes"],
+        keep_best=params["keep_best"],
+        similarity_threshold=params["similarity_threshold"],
+        clock_factor=params["clock_factor"],
+        dump_raw_windows=params["dump_raw_windows"],
+        write_manifest=True,
+        write_report=True,
+        force=force,
+        track_step=params["track_step"],
+    )
+    reconstructor.run()
+
+
 def qc_capture(
     input_path: Path,
     *,
@@ -383,10 +514,24 @@ def qc_capture(
     track_step: str | int = "auto",
     sectors_per_rotation: int | None = None,
     revs: int | None = None,
+    reconstruct: bool | None = None,
+    cache_dir: Path | None = None,
+    force_reconstruct: bool = False,
+    reconstruct_out: Path | None = None,
+    logical_sectors: int = 16,
+    recon_sectors_per_rotation: int = 32,
+    sector_sizes: Sequence[int] | None = None,
+    keep_best: int = 3,
+    similarity_threshold: float = 0.80,
+    clock_factor: float = 1.0,
+    dump_raw_windows: bool = False,
+    force: bool = False,
 ) -> dict:
     path = Path(input_path)
+    cache_root = Path(cache_dir) if cache_dir is not None else Path(".qc_cache")
+
     if path.suffix.lower() == ".scp":
-        report = qc_from_scp(
+        capture_report = qc_from_scp(
             path,
             mode=mode,
             tracks=tracks,
@@ -395,7 +540,84 @@ def qc_capture(
             sectors_per_rotation=sectors_per_rotation,
             revs=revs,
         )
-        return report
+        use_reconstruct = reconstruct is not False
+        scp_hash = _hash_file(path)
+
+        if not use_reconstruct:
+            capture_report["pipeline"] = ["capture_qc"]
+            capture_report["reconstruct"] = {
+                "enabled": False,
+                "out_dir": None,
+                "cache_dir": str(cache_root),
+                "used_cache": False,
+                "scp_sha1": scp_hash,
+                "params": None,
+            }
+            return capture_report
+
+        recon_tracks = tracks if tracks is not None else list(range(0, 77))
+        recon_sector_sizes = (
+            sector_sizes if sector_sizes is not None else _parse_sector_sizes("auto")
+        )
+        params = _normalize_reconstruct_params(
+            tracks=recon_tracks,
+            side=side,
+            track_step=track_step,
+            logical_sectors=logical_sectors,
+            sectors_per_rotation=recon_sectors_per_rotation,
+            sector_sizes=recon_sector_sizes,
+            keep_best=keep_best,
+            similarity_threshold=similarity_threshold,
+            clock_factor=clock_factor,
+            dump_raw_windows=dump_raw_windows,
+        )
+
+        cache_root.mkdir(parents=True, exist_ok=True)
+        output_dir, scp_hash = _cache_dir_for_run(
+            path, cache_root, params, scp_hash
+        )
+        used_cache = False
+
+        if reconstruct_out is not None:
+            output_dir = Path(reconstruct_out)
+            _ensure_empty_dir(output_dir, allow_nonempty=force or force_reconstruct)
+        elif not force_reconstruct and output_dir.exists():
+            manifest_path = output_dir / "manifest.json"
+            if manifest_path.exists():
+                used_cache = True
+
+        if not used_cache:
+            _run_reconstruction(
+                path,
+                output_dir,
+                params,
+                force=force or force_reconstruct or output_dir.exists(),
+            )
+
+        recon_report = qc_from_outdir(output_dir, mode=mode)
+        combined = _base_report("scp", path, mode)
+        combined["pipeline"] = ["capture_qc", "reconstruct", "reconstruction_qc"]
+        combined["capture_qc"] = capture_report.get("capture_qc")
+        combined["reconstruction_qc"] = recon_report.get("reconstruction_qc")
+        combined["per_track"] = recon_report.get("per_track")
+        combined["per_sector"] = recon_report.get("per_sector")
+        combined["reconstruction_per_track"] = recon_report.get(
+            "reconstruction_per_track"
+        )
+        combined["reconstruction_per_sector"] = recon_report.get(
+            "reconstruction_per_sector"
+        )
+        combined["capture_per_track"] = capture_report.get("per_track")
+        combined["reconstruct"] = {
+            "enabled": True,
+            "out_dir": str(output_dir),
+            "cache_dir": str(output_dir if reconstruct_out else cache_root),
+            "used_cache": used_cache,
+            "scp_sha1": scp_hash,
+            "params": params,
+        }
+        combined["overall"] = _merge_overall(capture_report, recon_report)
+        return combined
 
     if path.is_dir() and (path / "manifest.json").exists():
         return qc_from_outdir(path, mode=mode)
@@ -429,8 +651,11 @@ def _reconstruction_issue_score(entry: dict) -> int:
     return missing * 5 + no_decode * 3 + crc_fail + low_conf
 
 
-def format_capture_report(report: dict, limit: int = 5) -> str:
-    lines: list[str] = [summarize_qc(report), "", "Capture QC:"]
+def format_capture_report(report: dict, limit: int = 5, *, include_summary: bool = True) -> str:
+    lines: list[str] = []
+    if include_summary:
+        lines.extend([summarize_qc(report), ""])
+    lines.append("Capture QC:")
     capture = report.get("capture_qc") or {}
     present_tracks = capture.get("present_tracks") or []
     missing_tracks = capture.get("missing_tracks") or []
@@ -438,7 +663,7 @@ def format_capture_report(report: dict, limit: int = 5) -> str:
         f"  tracks present={len(present_tracks)} missing={len(missing_tracks)} sectors_per_rotation={capture.get('sectors_per_rotation')} revs_requested={capture.get('revs_requested')}"
     )
 
-    tracks = report.get("per_track") or []
+    tracks = capture.get("per_track") or report.get("per_track") or []
     scored = [entry for entry in tracks if _capture_issue_score(entry) > 0]
     scored.sort(key=_capture_issue_score, reverse=True)
     lines.append("Top affected tracks:")
@@ -466,9 +691,11 @@ def format_capture_report(report: dict, limit: int = 5) -> str:
                     else f"cv={timing_cv:.3f}"
                 )
             anomalies = entry.get("anomalies") or {}
+            scp_track = entry.get("scp_track_id")
+            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
             lines.append(
                 "  "
-                + f"T{entry.get('track'):02d}: windows={window_desc} missing_windows={missing_windows} "
+                + f"T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
                 + f"timing={timing_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
             )
 
@@ -497,8 +724,10 @@ def format_capture_report(report: dict, limit: int = 5) -> str:
             elif windows_captured is not None:
                 window_desc = str(windows_captured)
 
+            scp_track = entry.get("scp_track_id")
+            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
             detail_line = (
-                f"  T{entry.get('track'):02d}: windows={window_desc} missing_windows={missing_windows} "
+                f"  T{entry.get('track'):02d}{scp_note}: windows={window_desc} missing_windows={missing_windows} "
                 f"{timing_note} dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)}"
             )
             notes = entry.get("notes") or []
@@ -536,11 +765,18 @@ def _format_failure_entry(entry: dict) -> str:
 
 
 def format_reconstruction_report(
-    report: dict, limit: int = 5, failure_cap: int = 100
+    report: dict, limit: int = 5, failure_cap: int = 100, *, include_summary: bool = True
 ) -> str:
-    lines: list[str] = [summarize_qc(report), "", "Reconstruction QC:"]
+    lines: list[str] = []
+    if include_summary:
+        lines.extend([summarize_qc(report), ""])
+    lines.append("Reconstruction QC:")
     recon = report.get("reconstruction_qc") or {}
-    per_track = report.get("per_track") or []
+    per_track = (
+        report.get("reconstruction_per_track")
+        or report.get("per_track")
+        or []
+    )
     missing_count = len(recon.get("missing_sectors") or [])
     lines.append(
         "  "
@@ -555,14 +791,20 @@ def format_reconstruction_report(
         lines.append("  No affected tracks detected.")
     else:
         for entry in top_tracks[:limit]:
+            scp_track = entry.get("scp_track_id")
+            scp_note = f" (scp={scp_track})" if scp_track is not None else ""
             lines.append(
                 "  "
-                + f"T{entry.get('track'):02d}: missing={len(entry.get('missing_sectors') or [])} "
+                + f"T{entry.get('track'):02d}{scp_note}: missing={len(entry.get('missing_sectors') or [])} "
                 + f"crc_fail={entry.get('crc_fail', 0)} no_decode={entry.get('no_decode', 0)} low_conf={entry.get('low_confidence', 0)}"
             )
 
     if report.get("mode") == "detail":
-        failures = report.get("per_sector") or []
+        failures = (
+            report.get("reconstruction_per_sector")
+            or report.get("per_sector")
+            or []
+        )
         if failures:
             lines.append("Failures:")
             for entry in failures[:failure_cap]:
@@ -584,6 +826,29 @@ def format_reconstruction_report(
 
 
 def format_detail_summary(report: dict, limit: int = 5) -> str:
+    pipeline = report.get("pipeline") or []
+    if report.get("input", {}).get("type") == "scp" and "reconstruction_qc" in pipeline:
+        cache_note = report.get("reconstruct") or {}
+        cache_line = None
+        if cache_note.get("enabled"):
+            cache_line = (
+                "Reconstruction: reused cache at "
+                + str(cache_note.get("out_dir"))
+                if cache_note.get("used_cache")
+                else "Reconstruction: generated cache at " + str(cache_note.get("out_dir"))
+            )
+        lines: list[str] = []
+        lines.append(summarize_qc(report))
+        lines.append("")
+        lines.extend(format_capture_report(report, limit=limit, include_summary=False).splitlines())
+        lines.append("")
+        recon_lines = format_reconstruction_report(
+            report, limit=limit, failure_cap=100, include_summary=False
+        ).splitlines()
+        lines.extend(recon_lines)
+        if cache_line:
+            lines.append(cache_line)
+        return "\n".join(lines)
     if report.get("input", {}).get("type") == "scp":
         return format_capture_report(report, limit=limit)
     return format_reconstruction_report(report, limit=limit)
