@@ -57,8 +57,8 @@ human-readable summary and writes JSON alongside the inputs unless `--out` is pr
 
 ```bash
 # SCP capture integrity
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode brief
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode detail --sectors-per-rotation 16 --revs 5
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode detail --sectors-per-rotation 16 --revs 5 --cache-dir .qc_cache
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode brief --no-reconstruct
 
 # Reconstruction output health
 python -m hardsector_tool qc-capture out_80221_v3 --mode brief
