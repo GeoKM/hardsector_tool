@@ -396,6 +396,13 @@ def qc_from_scp(
         "missing_tracks": missing_tracks,
         "sectors_per_rotation": sectors_per_rotation,
         "revs_requested": revs,
+        "params": {
+            "tracks": list(tracks),
+            "side": side,
+            "track_step": str(track_step),
+            "sectors_per_rotation": sectors_per_rotation,
+            "revs": revs,
+        },
         "per_track": per_track_entries,
     }
 

@@ -626,102 +626,106 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Summary (brief) or detailed report",
     )
     qc.add_argument("--out", type=Path, help="Optional JSON output path")
-    qc.add_argument("--tracks", default="0-76", help="Track range for SCP inputs")
     qc.add_argument(
-        "--side", type=int, default=0, help="Head/side index for SCP inputs"
+        "--tracks", default="0-76", help="[SCP QC] Track range for SCP inputs"
+    )
+    qc.add_argument(
+        "--side", type=int, default=0, help="[SCP QC] Head/side index for SCP inputs"
     )
     qc.add_argument(
         "--track-step",
         choices=["auto", "1", "2"],
         default="auto",
-        help="SCP track spacing assumption for capture QC",
+        help="[SCP QC] SCP track spacing assumption for capture QC",
     )
     qc.add_argument(
         "--sectors-per-rotation",
         type=int,
         default=None,
-        help="Hard-sector holes per rotation (SCP QC only)",
+        help="[SCP QC] Hard-sector holes per rotation",
     )
     qc.add_argument(
-        "--revs", type=int, default=None, help="Expected revolutions for capture"
+        "--revs", type=int, default=None, help="[SCP QC] Expected revolutions for capture"
     )
     qc.add_argument(
         "--fail-thresholds",
         default="conservative",
         help="Failure threshold presets (reserved for future use)",
     )
-    qc.add_argument(
+    recon_toggle = qc.add_mutually_exclusive_group()
+    recon_toggle.set_defaults(reconstruct=None)
+    recon_toggle.add_argument(
         "--reconstruct",
         dest="reconstruct",
         action="store_true",
-        help="Enable reconstruction pass for SCP inputs (default)",
+        help="[reconstruct] Force reconstruction pass (default for .scp inputs)",
     )
-    qc.add_argument(
+    recon_toggle.add_argument(
         "--no-reconstruct",
         dest="reconstruct",
         action="store_false",
-        help="Skip reconstruction; capture QC only",
+        help="[reconstruct] Skip reconstruction; capture QC only",
     )
     qc.add_argument(
         "--cache-dir",
         type=Path,
         default=Path(".qc_cache"),
-        help="Cache directory for reconstruction outputs",
+        help="[reconstruct] Cache directory for reconstruction outputs",
     )
     qc.add_argument(
         "--force-reconstruct",
         action="store_true",
-        help="Ignore cache and rerun reconstruction",
+        help="[reconstruct] Ignore cache and rerun reconstruction",
     )
     qc.add_argument(
         "--reconstruct-out",
         type=Path,
-        help="Write reconstruction output to this directory instead of cache",
+        help="[reconstruct] Write reconstruction output to this directory instead of cache",
     )
     qc.add_argument(
         "--logical-sectors",
         type=int,
         default=16,
-        help="Logical sectors per track for reconstruction",
+        help="[reconstruct] Logical sectors per track",
     )
     qc.add_argument(
         "--reconstruct-sectors-per-rotation",
         type=int,
         default=None,
-        help="Hard-sector holes per rotation for reconstruction",
+        help="[reconstruct] Hard-sector holes per rotation",
     )
     qc.add_argument(
         "--sector-sizes",
         default="auto",
-        help="Comma-separated sector sizes to try for reconstruction",
+        help="[reconstruct] Comma-separated sector sizes to try",
     )
     qc.add_argument(
         "--keep-best",
         type=int,
         default=3,
-        help="Number of rotations to keep when reconstructing",
+        help="[reconstruct] Number of rotations to keep when reconstructing",
     )
     qc.add_argument(
         "--similarity-threshold",
         type=float,
         default=0.80,
-        help="Similarity threshold for rotation consensus",
+        help="[reconstruct] Similarity threshold for rotation consensus",
     )
     qc.add_argument(
         "--clock-factor",
         type=float,
         default=1.0,
-        help="Clock factor passed to Wang reconstruction",
+        help="[reconstruct] Clock factor passed to Wang reconstruction",
     )
     qc.add_argument(
         "--dump-raw-windows",
         action="store_true",
-        help="Dump decoded window bytes for debugging (reconstruction)",
+        help="[reconstruct] Dump decoded window bytes for debugging",
     )
     qc.add_argument(
         "--force",
         action="store_true",
-        help="Allow overwriting a reconstruction output directory",
+        help="[reconstruct] Allow overwriting a reconstruction output directory",
     )
 
     return parser
@@ -788,12 +792,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         track_list = _parse_track_range(args.tracks) if args.tracks else None
         sector_sizes = _parse_sector_sizes(args.sector_sizes)
-        recon_spr = (
-            args.reconstruct_sectors_per_rotation
-            if args.reconstruct_sectors_per_rotation is not None
-            else args.sectors_per_rotation
-            if args.sectors_per_rotation is not None
-            else 32
+        capture_spr = args.sectors_per_rotation
+        recon_spr = args.reconstruct_sectors_per_rotation
+
+        if capture_spr is None and recon_spr is not None:
+            capture_spr = recon_spr
+        if recon_spr is None:
+            recon_spr = capture_spr if capture_spr is not None else 32
+        elif capture_spr is None:
+            capture_spr = recon_spr
+
+        reconstruct_default = args.input.suffix.lower() == ".scp"
+        reconstruct_flag = (
+            args.reconstruct if args.reconstruct is not None else reconstruct_default
         )
         try:
             report = qc.qc_capture(
@@ -802,9 +813,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tracks=track_list,
                 side=args.side,
                 track_step=args.track_step,
-                sectors_per_rotation=args.sectors_per_rotation,
+                sectors_per_rotation=capture_spr,
                 revs=args.revs,
-                reconstruct=args.reconstruct,
+                reconstruct=reconstruct_flag,
                 cache_dir=args.cache_dir,
                 force_reconstruct=args.force_reconstruct,
                 reconstruct_out=args.reconstruct_out,
