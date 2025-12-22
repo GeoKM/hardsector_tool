@@ -111,6 +111,46 @@ def test_qc_scp_missing_track(monkeypatch, tmp_path: Path) -> None:
     assert 1 in report["capture_qc"]["missing_tracks"]
 
 
+def test_scp_capture_reports_hole_interval(monkeypatch, tmp_path: Path) -> None:
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [
+                SimpleNamespace(index_ticks=1000),
+                SimpleNamespace(index_ticks=3000),
+            ]
+            self.revolution_count = len(self.revolutions)
+
+        def decode_flux(self, rev_index: int):
+            return [10, 12, 11, 13]
+
+    class FakeImage:
+        def __init__(self, present: list[int]):
+            self._present = present
+            self.header = SimpleNamespace(sides=1, revolutions=2)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls([0])
+
+        def list_present_tracks(self, side: int):
+            return self._present
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+
+    report = qc.qc_from_scp(
+        tmp_path / "fake.scp", mode="brief", tracks=[0], sectors_per_rotation=4, revs=2
+    )
+    track_entry = report["capture_qc"]["per_track"][0]
+
+    assert track_entry["windows_captured"] == 2
+    assert track_entry["expected_windows"] == 8
+    assert track_entry["hole_interval"]["cv"] is not None
+    assert any("hole_interval_cv" in reason for reason in report["overall"]["reasons"])
+
+
 def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) -> None:
     class FakeTrack:
         def __init__(self) -> None:
@@ -142,6 +182,39 @@ def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) ->
     assert "windows=" in output
     assert "crc_fail=" not in output
     assert "no_decode=" not in output
+
+
+def test_brief_reasons_are_summarized(monkeypatch, tmp_path: Path) -> None:
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [SimpleNamespace(index_ticks=1000), SimpleNamespace(index_ticks=5000)]
+            self.revolution_count = len(self.revolutions)
+
+        def decode_flux(self, rev_index: int):
+            return [10, 12, 11, 13]
+
+    class FakeImage:
+        def __init__(self, present: list[int]):
+            self._present = present
+            self.header = SimpleNamespace(sides=1, revolutions=2)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls(list(range(5)))
+
+        def list_present_tracks(self, side: int):
+            return self._present
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+
+    report = qc.qc_from_scp(tmp_path / "fake.scp", mode="brief", tracks=list(range(5)))
+
+    reasons = report["overall"]["reasons"]
+    assert len(reasons) < 5
+    assert any("hole_interval_cv elevated" in reason for reason in reasons)
 
 
 def test_reconstruction_failures_listed(tmp_path: Path) -> None:
@@ -185,6 +258,69 @@ def _write_minimal_recon_out(out_dir: Path) -> None:
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
     tracks_dir.joinpath("T00.json").write_text(json.dumps({"sectors": [{"sector_id": 0}]}))
     sectors_dir.joinpath("T00_S00.bin").write_bytes(b"ok")
+
+
+def test_reconstruction_logs_suppressed(monkeypatch, tmp_path: Path, capsys) -> None:
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [SimpleNamespace(index_ticks=1000)]
+            self.revolution_count = 1
+
+        def decode_flux(self, rev_index: int):
+            return [10, 11, 12]
+
+    class FakeImage:
+        def __init__(self) -> None:
+            self.header = SimpleNamespace(sides=1, revolutions=1)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls()
+
+        def list_present_tracks(self, side: int):
+            return [0]
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    logs: list[str] = []
+
+    class FakeReconstructor:
+        def __init__(self, *, output_dir: Path, **_: object) -> None:
+            self.output_dir = output_dir
+
+        def run(self) -> None:
+            print("NOISY LOG")
+            logs.append("ran")
+            _write_minimal_recon_out(self.output_dir)
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+    monkeypatch.setattr(qc, "DiskReconstructor", FakeReconstructor)
+
+    scp_path = tmp_path / "image.scp"
+    scp_path.write_bytes(b"data")
+
+    qc.qc_capture(
+        scp_path,
+        mode="brief",
+        tracks=[0],
+        reconstruct=True,
+        reconstruct_out=tmp_path / "out_quiet",
+    )
+    captured = capsys.readouterr()
+    assert "NOISY LOG" not in captured.out
+
+    qc.qc_capture(
+        scp_path,
+        mode="brief",
+        tracks=[0],
+        reconstruct=True,
+        reconstruct_out=tmp_path / "out_verbose",
+        reconstruct_verbose=True,
+        force_reconstruct=True,
+    )
+    captured_verbose = capsys.readouterr()
+    assert "NOISY LOG" in captured_verbose.out
 
 
 def test_qc_capture_pipeline_uses_cache(monkeypatch, tmp_path: Path) -> None:
