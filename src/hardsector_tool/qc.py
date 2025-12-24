@@ -476,14 +476,15 @@ def qc_from_scp(
             holes_effective * revs if holes_effective is not None and revs else None
         )
 
-        intervals_for_metrics = (
-            hole_windows
-            if hole_windows is not None
-            else [[getattr(rev, "index_ticks", 0) for rev in track_data.revolutions]]
-        )
-        hole_interval = _hole_interval_metrics(
-            intervals_for_metrics, holes_effective if hole_windows else None
-        )
+        hole_interval: dict = {
+            "mean": None,
+            "stdev": None,
+            "cv": None,
+            "cv_noindex": None,
+            "index_gap_ratio": None,
+        }
+        if hole_windows is not None:
+            hole_interval = _hole_interval_metrics(hole_windows, holes_effective)
         if holes_effective is not None:
             capture_holes_effective = holes_effective
         revs_estimated = (
@@ -782,13 +783,16 @@ def qc_capture(
     cache_root = Path(cache_dir) if cache_dir is not None else Path(".qc_cache")
 
     if path.suffix.lower() == ".scp":
+        capture_sectors_per_rotation = sectors_per_rotation
+        if capture_sectors_per_rotation is None and reconstruct is not False:
+            capture_sectors_per_rotation = recon_sectors_per_rotation
         capture_report = qc_from_scp(
             path,
             mode=mode,
             tracks=tracks,
             side=side,
             track_step=track_step,
-            sectors_per_rotation=sectors_per_rotation,
+            sectors_per_rotation=capture_sectors_per_rotation,
             revs=revs,
             show_all_tracks=show_all_tracks,
         )
@@ -853,7 +857,7 @@ def qc_capture(
         recon_report = qc_from_outdir(
             output_dir, mode=mode, show_all_tracks=show_all_tracks
         )
-        effective_holes = sectors_per_rotation or recon_sectors_per_rotation
+        effective_holes = capture_sectors_per_rotation or recon_sectors_per_rotation
         _apply_capture_expectations(
             capture_report.get("capture_qc") or {},
             holes_per_rotation=effective_holes,
@@ -1054,15 +1058,15 @@ def _format_capture_detail_lines(
             windows_label = "flux_intervals_total"
             if flux_intervals is not None:
                 window_desc = str(flux_intervals)
-        hole_cv = entry.get("hole_interval_cv_noindex")
-        if hole_cv is None:
+        hole_cv = entry.get("hole_interval_cv_noindex") if has_holes else None
+        if hole_cv is None and has_holes:
             hole_cv = (entry.get("hole_interval") or {}).get("cv")
         hole_note = (
             f"hole_cv_noindex={hole_cv:.3f}"
             if hole_cv is not None
             else "hole_cv_noindex=n/a"
         )
-        index_gap = entry.get("index_gap_ratio")
+        index_gap = entry.get("index_gap_ratio") if has_holes else None
         gap_note = (
             f"index_gap_ratio={index_gap:.2f}"
             if index_gap is not None
@@ -1079,6 +1083,11 @@ def _format_capture_detail_lines(
         lines.append(line)
     if len(lines) == 1 and not show_all:
         lines.append("  (all tracks PASS; use --show-all-tracks to display)")
+    if len(lines) > 1:
+        lines.append(
+            "  Note: noise/dropout count heuristic flux anomalies; reconstruction QC"
+            " indicates any decode impact."
+        )
     return lines
 
 

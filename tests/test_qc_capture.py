@@ -77,6 +77,88 @@ def test_qc_outdir_crc_only_warning(tmp_path: Path) -> None:
     assert any("CRC-like" in reason for reason in report["overall"]["reasons"])
 
 
+def test_capture_qc_reuses_reconstruction_timing(monkeypatch, tmp_path: Path) -> None:
+    class FakeGrouping:
+        def __init__(self, groups, sectors_per_rotation: int) -> None:
+            self.groups = groups
+            self.sectors_per_rotation = sectors_per_rotation
+
+    class FakeTrack:
+        def __init__(self) -> None:
+            self.revolutions = [SimpleNamespace(index_ticks=250) for _ in range(2)]
+            self.revolution_count = len(self.revolutions)
+
+        def decode_flux(self, rev_index: int):
+            return [10, 12, 11, 13]
+
+    class FakeImage:
+        def __init__(self, present: list[int]):
+            self._present = present
+            self.header = SimpleNamespace(sides=1, revolutions=2, flags=1)
+
+        @classmethod
+        def from_file(cls, path: Path):
+            return cls([0])
+
+        def list_present_tracks(self, side: int):
+            return self._present
+
+        def read_track(self, track_number: int):
+            return FakeTrack()
+
+    def fake_group(track, sectors_per_rotation: int = 4, index_aligned: bool = True):
+        groups = [
+            [SimpleNamespace(index_ticks=250) for _ in range(sectors_per_rotation)]
+            for _ in range(2)
+        ]
+        return FakeGrouping(groups, sectors_per_rotation)
+
+    monkeypatch.setattr(qc, "SCPImage", FakeImage)
+    monkeypatch.setattr(qc, "group_hard_sectors", fake_group)
+    monkeypatch.setattr(qc, "_hash_file", lambda path: "hash")
+    monkeypatch.setattr(
+        qc,
+        "_cache_dir_for_run",
+        lambda path, cache_root, params, scp_hash=None: (tmp_path / "out", "hash"),
+    )
+    monkeypatch.setattr(qc, "_run_reconstruction", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        qc,
+        "qc_from_outdir",
+        lambda *args, **kwargs: {
+            "overall": {"status": "PASS", "reasons": ["all checks passed"], "suggestions": []},
+            "reconstruction_qc": {
+                "expected_sectors": 16,
+                "written_sectors": 16,
+                "missing_sectors": [],
+                "crc_fail_count": 0,
+                "no_decode_count": 0,
+                "low_confidence_count": 0,
+                "per_sector_failures": [],
+            },
+        },
+    )
+
+    report = qc.qc_capture(
+        tmp_path / "fake.scp",
+        mode="brief",
+        tracks=[0],
+        sectors_per_rotation=None,
+        revs=2,
+        reconstruct=True,
+        recon_sectors_per_rotation=16,
+        reconstruct_out=tmp_path / "out",
+        show_all_tracks=True,
+    )
+
+    capture_entry = report["capture_qc"]["per_track"][0]
+
+    assert report["capture_qc"]["holes_per_rotation_effective"] == 16
+    assert capture_entry["windows_captured"] == 32
+    assert capture_entry.get("expected_windows") == 32
+    assert capture_entry.get("hole_interval_cv_noindex") is not None
+
+
 def test_qc_scp_missing_track(monkeypatch, tmp_path: Path) -> None:
     class FakeTrack:
         def __init__(self) -> None:
@@ -196,6 +278,32 @@ def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) ->
     assert "Reconstruction: not run" in output
 
 
+def test_capture_formatting_marks_missing_timing() -> None:
+    capture = {
+        "per_track": [
+            {
+                "track": 0,
+                "status": "PASS",
+                "windows_captured": None,
+                "expected_windows": None,
+                "hole_interval": {},
+                "hole_interval_cv_noindex": None,
+                "index_gap_ratio": None,
+                "anomalies": {"noise": 0, "dropouts": 0},
+                "flux_intervals_total": 4,
+            }
+        ],
+        "missing_tracks": [],
+        "holes_per_rotation_effective": None,
+    }
+
+    lines = qc._format_capture_detail_lines(capture, show_all=True)
+
+    assert any("hole_cv_noindex=n/a" in line for line in lines)
+    assert any("index_gap_ratio=n/a" in line for line in lines)
+    assert any("heuristic flux anomalies" in line for line in lines)
+
+
 def test_detail_suppresses_pass_tracks_by_default() -> None:
     report = {
         "mode": "detail",
@@ -304,7 +412,8 @@ def test_brief_reasons_are_summarized(monkeypatch, tmp_path: Path) -> None:
 
     reasons = report["overall"]["reasons"]
     assert len(reasons) < 5
-    assert any("hole timing" in reason for reason in reasons)
+    assert any("all checks passed" == reason for reason in reasons)
+    assert not any("hole timing" in reason for reason in reasons)
 
 
 def test_reconstruction_failures_listed(tmp_path: Path) -> None:
