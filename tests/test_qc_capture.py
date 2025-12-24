@@ -112,12 +112,14 @@ def test_qc_scp_missing_track(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_scp_capture_reports_hole_interval(monkeypatch, tmp_path: Path) -> None:
+    class FakeGrouping:
+        def __init__(self, groups, sectors_per_rotation: int) -> None:
+            self.groups = groups
+            self.sectors_per_rotation = sectors_per_rotation
+
     class FakeTrack:
         def __init__(self) -> None:
-            self.revolutions = [
-                SimpleNamespace(index_ticks=1000),
-                SimpleNamespace(index_ticks=3000),
-            ]
+            self.revolutions = [SimpleNamespace(index_ticks=250) for _ in range(10)]
             self.revolution_count = len(self.revolutions)
 
         def decode_flux(self, rev_index: int):
@@ -138,20 +140,28 @@ def test_scp_capture_reports_hole_interval(monkeypatch, tmp_path: Path) -> None:
         def read_track(self, track_number: int):
             return FakeTrack()
 
+    def fake_group(track, sectors_per_rotation: int = 4, index_aligned: bool = True):
+        groups = [
+            [SimpleNamespace(index_ticks=250) for _ in range(sectors_per_rotation)]
+            for _ in range(2)
+        ]
+        return FakeGrouping(groups, sectors_per_rotation)
+
     monkeypatch.setattr(qc, "SCPImage", FakeImage)
+    monkeypatch.setattr(qc, "group_hard_sectors", fake_group)
 
     report = qc.qc_from_scp(
         tmp_path / "fake.scp", mode="brief", tracks=[0], sectors_per_rotation=4, revs=2
     )
     track_entry = report["capture_qc"]["per_track"][0]
 
-    assert track_entry["windows_captured"] == 2
+    assert track_entry["windows_captured"] == 8
     assert track_entry["expected_windows"] == 8
     assert (
         track_entry["hole_interval"].get("cv") is not None
         or track_entry.get("hole_interval_cv_noindex") is not None
     )
-    assert any("hole timing" in reason for reason in report["overall"]["reasons"])
+    assert report["overall"]["status"] == "PASS"
 
 
 def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) -> None:
@@ -182,8 +192,83 @@ def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) ->
     report = qc.qc_from_scp(tmp_path / "fake.scp", mode="detail", tracks=[0])
     output = qc.format_detail_summary(report)
 
-    assert "windows=" in output
+    assert "flux_intervals_total=" in output
     assert "Reconstruction: not run" in output
+
+
+def test_detail_suppresses_pass_tracks_by_default() -> None:
+    report = {
+        "mode": "detail",
+        "show_all_tracks": False,
+        "overall": {"status": "WARN", "reasons": ["issue"], "suggestions": []},
+        "capture_qc": {
+            "per_track": [
+                {
+                    "track": 0,
+                    "status": "PASS",
+                    "windows_captured": 4,
+                    "expected_windows": 4,
+                    "hole_interval": {},
+                    "hole_interval_cv_noindex": None,
+                    "index_gap_ratio": None,
+                    "anomalies": {"noise": 0, "dropouts": 0},
+                    "flux_intervals_total": 4,
+                },
+                {
+                    "track": 1,
+                    "status": "WARN",
+                    "windows_captured": 3,
+                    "expected_windows": 4,
+                    "hole_interval": {},
+                    "hole_interval_cv_noindex": 0.2,
+                    "index_gap_ratio": 1.1,
+                    "anomalies": {"noise": 1, "dropouts": 0},
+                    "flux_intervals_total": 3,
+                },
+            ],
+            "missing_tracks": [],
+            "holes_per_rotation_effective": 4,
+        },
+        "reconstruction_qc": {
+            "expected_sectors": 2,
+            "written_sectors": 1,
+            "missing_sectors": [(1, 0)],
+            "crc_fail_count": 0,
+            "no_decode_count": 0,
+            "low_confidence_count": 0,
+            "per_track": [
+                {
+                    "track": 0,
+                    "sectors_present": 1,
+                    "sectors_expected": 1,
+                    "missing_sectors": [],
+                    "crc_fail": 0,
+                    "no_decode": 0,
+                    "low_confidence": 0,
+                },
+                {
+                    "track": 1,
+                    "sectors_present": 1,
+                    "sectors_expected": 2,
+                    "missing_sectors": [1],
+                    "crc_fail": 0,
+                    "no_decode": 0,
+                    "low_confidence": 0,
+                },
+            ],
+            "per_sector_failures": [],
+        },
+    }
+
+    output = qc.format_detail_summary(report)
+
+    assert "T00" not in output
+    assert "T01" in output
+
+    report["show_all_tracks"] = True
+    output_all = qc.format_detail_summary(report)
+
+    assert "T00" in output_all
 
 
 def test_brief_reasons_are_summarized(monkeypatch, tmp_path: Path) -> None:
@@ -430,15 +515,27 @@ def test_qc_capture_out_dir_pipeline(tmp_path: Path) -> None:
 
 
 def test_hole_interval_metrics_ignore_index_gap() -> None:
-    revolutions = [
-        SimpleNamespace(index_ticks=v) for v in [100, 102, 98, 300, 101, 99, 100, 310]
+    intervals = [
+        [100, 102, 98, 300],
+        [101, 99, 100, 310],
     ]
 
-    stats = qc._hole_interval_metrics(revolutions, 4)
+    stats = qc._hole_interval_metrics(intervals, 4)
 
     assert stats["cv"] > 0.1
     assert stats["cv_noindex"] is not None
     assert stats["cv_noindex"] < stats["cv"]
+
+
+def test_hole_interval_metrics_detect_index_gap_ratio() -> None:
+    per_rotation = [[100] * 15 + [220] for _ in range(5)]
+
+    stats = qc._hole_interval_metrics(per_rotation, 16)
+
+    assert stats["index_gap_ratio"] is not None
+    assert stats["index_gap_ratio"] > 1.0
+    assert stats["cv_noindex"] is not None
+    assert stats["cv_noindex"] < 0.01
 
 
 def test_top_issues_empty_when_zero() -> None:
