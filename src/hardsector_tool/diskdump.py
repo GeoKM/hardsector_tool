@@ -625,6 +625,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="brief",
         help="Summary (brief) or detailed report",
     )
+    qc.add_argument(
+        "--show-all-tracks",
+        action="store_true",
+        help="Show PASS tracks in detail mode for capture and reconstruction QC",
+    )
     qc.add_argument("--out", type=Path, help="Optional JSON output path")
     qc.add_argument(
         "--tracks", default="0-76", help="[SCP QC] Track range for SCP inputs"
@@ -833,6 +838,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dump_raw_windows=args.dump_raw_windows,
                 force=args.force,
                 reconstruct_verbose=args.reconstruct_verbose,
+                show_all_tracks=args.show_all_tracks,
             )
         except ValueError as exc:
             parser.error(str(exc))
