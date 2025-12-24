@@ -819,6 +819,15 @@ def qc_capture(
         combined_overall = _merge_overall(capture_report, recon_report)
         capture_status = (capture_report.get("overall") or {}).get("status", "PASS")
         recon_status = (recon_report.get("overall") or {}).get("status", "PASS")
+        capture_per_track = (
+            (capture_report.get("capture_qc") or {}).get("per_track") or []
+        )
+        anomaly_tracks = [
+            (entry.get("track"), entry.get("anomalies") or {})
+            for entry in capture_per_track
+            if (entry.get("anomalies") or {}).get("dropouts")
+            or (entry.get("anomalies") or {}).get("noise")
+        ]
         if capture_status != "PASS" and recon_status == "PASS":
             noisy_tracks = len(anomaly_tracks)
             combined_reason = (
