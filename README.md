@@ -56,16 +56,29 @@ Use `qc-capture` to generate a preservation-focused report (brief by default, de
 human-readable summary and writes JSON alongside the inputs unless `--out` is provided.
 
 ```bash
-# SCP capture integrity
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode detail --sectors-per-rotation 16 --revs 5 --cache-dir .qc_cache
+# SCP capture integrity (full QC + reconstruction cached in .qc_cache)
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp \
+  --mode detail --sectors-per-rotation 16 --revs 5 --cache-dir .qc_cache
+
+# Capture-only QC (skip reconstruction entirely)
 python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode brief --no-reconstruct
 
-# Reconstruction output health
+# Explicit reconstruction target (write to a different directory than the cache)
+python -m hardsector_tool qc-capture ACMS80221-HS32.scp \
+  --mode detail --reconstruct-out out_80221_qc --force
+
+# Reconstruction output health (already decoded directory)
 python -m hardsector_tool qc-capture out_80221_v3 --mode brief
 python -m hardsector_tool qc-capture out_80221_v3 --mode detail --out qc_out.json
 ```
 
-By default the JSON is saved as `qc_<image>.json` for SCP inputs or `<out_dir>/qc.json` for reconstruction directories.
+Tips:
+
+* The QC JSON is saved as `qc_<image>.json` for SCP inputs or `<out_dir>/qc.json` for reconstruction directories unless `--out`
+  overrides the path.
+* `--track-step` controls track spacing assumptions during QC reconstruction (use `--track-step 2` for even-only heads).
+* `--reconstruct-verbose` mirrors `reconstruct-disk` debugging; combine with `--show-all-tracks` in `--mode detail` to audit
+  clean tracks as well as failures.
 
 ### Step 1 — Reconstruct logical sectors from a flux image
 
@@ -99,6 +112,12 @@ Examples:
 
   ```bash
   python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_debug --dump-raw-windows
+  ```
+
+* Force even-only track stepping (common for single-sided captures):
+
+  ```bash
+  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_even --track-step 2
   ```
 
 * Fast sanity run (decode just a few tracks while iterating):
@@ -225,13 +244,15 @@ python -m hardsector_tool reconstruct-disk --help
 python -m hardsector_tool extract-modules --help
 ```
 
-**Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules}`
+**Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules,qc-capture}`
 
 **reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
 
 **scan-metadata options:** `--out OUT out_dir`
 
 **extract-modules options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, `--dry-run`, `--force`
+
+**qc-capture options:** `--mode {brief,detail}`, `--tracks`, `--side`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--revs`, `--cache-dir`, `--reconstruct-out`, `--force`, `--reconstruct/--no-reconstruct`, `--reconstruct-verbose`, `--logical-sectors`, `--reconstruct-sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--show-all-tracks`
 
 ---
 
