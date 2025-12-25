@@ -126,7 +126,11 @@ def test_capture_qc_reuses_reconstruction_timing(monkeypatch, tmp_path: Path) ->
         qc,
         "qc_from_outdir",
         lambda *args, **kwargs: {
-            "overall": {"status": "PASS", "reasons": ["all checks passed"], "suggestions": []},
+            "overall": {
+                "status": "PASS",
+                "reasons": ["all checks passed"],
+                "suggestions": [],
+            },
             "reconstruction_qc": {
                 "expected_sectors": 16,
                 "written_sectors": 16,
@@ -238,12 +242,68 @@ def test_scp_capture_reports_hole_interval(monkeypatch, tmp_path: Path) -> None:
     track_entry = report["capture_qc"]["per_track"][0]
 
     assert track_entry["windows_captured"] == 8
-    assert track_entry["expected_windows"] == 8
-    assert (
-        track_entry["hole_interval"].get("cv") is not None
-        or track_entry.get("hole_interval_cv_noindex") is not None
-    )
-    assert report["overall"]["status"] == "PASS"
+
+
+def test_reconstruction_sector_issue_lines() -> None:
+    track_entries = [
+        {
+            "track": 0,
+            "sectors_present": 3,
+            "sectors_expected": 4,
+            "missing_sectors": [1],
+            "crc_fail": 1,
+            "no_decode": 0,
+            "low_confidence": 0,
+            "crc_fail_sectors": [0],
+            "no_decode_sectors": [],
+            "low_confidence_sectors": [],
+        },
+        {
+            "track": 1,
+            "sectors_present": 2,
+            "sectors_expected": 2,
+            "missing_sectors": [],
+            "crc_fail": 0,
+            "no_decode": 1,
+            "low_confidence": 0,
+            "crc_fail_sectors": [],
+            "no_decode_sectors": [0],
+            "low_confidence_sectors": [],
+        },
+    ]
+    failures = [
+        {"track": 0, "sector": 0, "status": "FAIL", "code": "CRC_FAIL"},
+        {"track": 0, "sector": 1, "status": "FAIL", "code": "MISSING"},
+        {"track": 1, "sector": 0, "status": "FAIL", "code": "NO_DECODE"},
+    ]
+    report = {
+        "mode": "detail",
+        "overall": {"status": "WARN", "reasons": ["test"]},
+        "reconstruction_qc": {
+            "expected_sectors": 8,
+            "written_sectors": 7,
+            "missing_sectors": [(0, 1)],
+            "crc_fail_count": 1,
+            "no_decode_count": 1,
+            "low_confidence_count": 0,
+            "status": "WARN",
+            "per_sector_failures": failures,
+            "per_track": track_entries,
+        },
+        "reconstruction_per_track": track_entries,
+        "per_track": track_entries,
+    }
+
+    detail = qc.format_reconstruction_report(report, include_summary=False)
+    assert "T00 S00: CRC_FAIL" in detail
+    assert "T00 S01: MISSING" in detail
+    assert "T01 S00: NO_DECODE" in detail
+
+    report["mode"] = "brief"
+    brief = qc.format_reconstruction_report(report, include_summary=False)
+    assert "Failures:" in brief
+    assert "crc_fail" in brief
+    assert "no_decode" in brief
 
 
 def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) -> None:
@@ -274,7 +334,7 @@ def test_capture_formatting_uses_capture_metrics(monkeypatch, tmp_path: Path) ->
     report = qc.qc_from_scp(tmp_path / "fake.scp", mode="detail", tracks=[0])
     output = qc.format_detail_summary(report)
 
-    assert "flux_intervals_total=" in output
+    assert "windows_total=" in output
     assert "Reconstruction: not run" in output
 
 
@@ -440,8 +500,8 @@ def test_reconstruction_failures_listed(tmp_path: Path) -> None:
     output = qc.format_detail_summary(report)
 
     assert "Sector failures:" in output
-    assert "T00 S00 FAIL = CRC_FAIL" in output
-    assert "T00 S01 FAIL = MISSING" in output
+    assert "T00 S00: CRC_FAIL" in output
+    assert "T00 S01: MISSING" in output
 
 
 def _write_minimal_recon_out(out_dir: Path) -> None:

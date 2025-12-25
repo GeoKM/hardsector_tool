@@ -17,7 +17,7 @@ from .diskdump import DiskReconstructor, map_logical_to_scp_track_id
 from .hardsector import group_hard_sectors
 from .scp import SCPImage
 
-QC_VERSION = 1
+QC_VERSION = 2
 
 
 _STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
@@ -25,6 +25,91 @@ _STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
 def _worse_status(current: str, candidate: str) -> str:
     return candidate if _STATUS_ORDER[candidate] > _STATUS_ORDER[current] else current
+
+
+def _capture_verdict(
+    *,
+    missing_tracks: list[int],
+    missing_window_tracks: list[tuple[int, int, int]],
+    hole_interval_warn_tracks: list[tuple[int, float]],
+    hole_interval_fail_tracks: list[tuple[int, float]],
+    anomaly_tracks: list[tuple[int, dict]],
+) -> dict:
+    status = "PASS"
+    reasons: list[str] = []
+    suggestions: list[str] = []
+
+    if missing_tracks:
+        status = _worse_status(status, "FAIL")
+        reasons.append(f"Missing tracks: {missing_tracks}")
+        suggestions.append("verify capture head/side selection and track range")
+
+    if missing_window_tracks:
+        status = _worse_status(status, "WARN")
+        reasons.append(
+            "Missing captured windows on " + f"{len(missing_window_tracks)} track(s)"
+        )
+
+    if hole_interval_fail_tracks:
+        status = _worse_status(status, "FAIL")
+        affected = len(hole_interval_fail_tracks)
+        reasons.append(f"Hole timing jitter high on {affected} track(s)")
+
+    if hole_interval_warn_tracks and not hole_interval_fail_tracks:
+        status = _worse_status(status, "WARN")
+        affected = len(hole_interval_warn_tracks)
+        reasons.append(f"Hole timing jitter elevated on {affected} track(s)")
+
+    if anomaly_tracks:
+        status = _worse_status(status, "WARN")
+        reasons.append(
+            "Noise/dropout anomalies on " + f"{len(anomaly_tracks)} track(s)"
+        )
+
+    reason_payload = reasons or (["all checks passed"] if status == "PASS" else [])
+    return {"status": status, "reasons": reason_payload, "suggestions": suggestions}
+
+
+def _reconstruction_verdict(
+    *,
+    missing_tracks: list[int],
+    missing_sectors: list[tuple[int, int]],
+    crc_fail_count: int,
+    no_decode_count: int,
+    low_conf_count: int,
+) -> dict:
+    status = "PASS"
+    reasons: list[str] = []
+    suggestions: list[str] = []
+
+    if missing_tracks:
+        status = _worse_status(status, "FAIL")
+        reasons.append(f"Missing tracks: {missing_tracks}")
+        suggestions.append("check SCP capture coverage or track mapping")
+
+    if missing_sectors:
+        status = _worse_status(status, "FAIL")
+        reasons.append(f"Missing sectors detected ({len(missing_sectors)})")
+        suggestions.append("review reconstruct-disk output for gaps")
+
+    if crc_fail_count > 0:
+        status = _worse_status(status, "WARN")
+        reasons.append("CRC-like integrity failures on reconstructed sectors")
+        suggestions.append("re-read media or verify checksums with another pass")
+
+    if no_decode_count > 0:
+        status = _worse_status(status, "WARN")
+        reasons.append(
+            "Un-decodable sectors present; capture/decoding limits suspected"
+        )
+        suggestions.append("inspect flux or adjust reconstruction parameters")
+
+    if low_conf_count > 0 and status == "PASS":
+        status = _worse_status(status, "WARN")
+        reasons.append("Low-confidence sectors detected")
+
+    reason_payload = reasons or (["all checks passed"] if status == "PASS" else [])
+    return {"status": status, "reasons": reason_payload, "suggestions": suggestions}
 
 
 def _extract_hole_windows(
@@ -101,20 +186,35 @@ def _derive_expected_sectors(manifest: dict) -> int | None:
     return None
 
 
-def _collect_track_issue_counts(track_meta: dict) -> tuple[int, int, int]:
-    crc_fail = int(track_meta.get("crc_fail_count") or 0)
-    no_decode = int(track_meta.get("no_decode_count") or 0)
-    low_confidence = int(track_meta.get("low_confidence_count") or 0)
+def _collect_track_issue_counts(track_meta: dict) -> dict:
+    crc_fail_sectors = []
+    no_decode_sectors = []
+    low_conf_sectors = []
+
     sectors = track_meta.get("sectors") or []
     for sector in sectors:
         status = (sector.get("status") or "").upper()
         if status == "CRC_FAIL":
-            crc_fail += 1
+            crc_fail_sectors.append(int(sector.get("sector_id", -1)))
         if status in {"NO_DECODE", "UNREADABLE"}:
-            no_decode += 1
+            no_decode_sectors.append(int(sector.get("sector_id", -1)))
         if status == "LOW_CONFIDENCE":
-            low_confidence += 1
-    return crc_fail, no_decode, low_confidence
+            low_conf_sectors.append(int(sector.get("sector_id", -1)))
+
+    crc_fail = max(len(crc_fail_sectors), int(track_meta.get("crc_fail_count") or 0))
+    no_decode = max(len(no_decode_sectors), int(track_meta.get("no_decode_count") or 0))
+    low_confidence = max(
+        len(low_conf_sectors), int(track_meta.get("low_confidence_count") or 0)
+    )
+
+    return {
+        "crc_fail": crc_fail,
+        "no_decode": no_decode,
+        "low_confidence": low_confidence,
+        "crc_fail_sectors": crc_fail_sectors,
+        "no_decode_sectors": no_decode_sectors,
+        "low_confidence_sectors": low_conf_sectors,
+    }
 
 
 def qc_from_outdir(
@@ -164,7 +264,10 @@ def qc_from_outdir(
             track_entry.get("recovered_sectors") or len(sectors_present_ids)
         )
         expected = expected_per_track or recovered
-        crc_fail, no_decode, low_conf = _collect_track_issue_counts(track_meta)
+        issue_stats = _collect_track_issue_counts(track_meta)
+        crc_fail = issue_stats["crc_fail"]
+        no_decode = issue_stats["no_decode"]
+        low_conf = issue_stats["low_confidence"]
 
         if track_entry.get("missing_reason"):
             missing_tracks.append(track_number)
@@ -189,6 +292,9 @@ def qc_from_outdir(
             "crc_fail": crc_fail,
             "no_decode": no_decode,
             "low_confidence": low_conf,
+            "crc_fail_sectors": issue_stats.get("crc_fail_sectors", []),
+            "no_decode_sectors": issue_stats.get("no_decode_sectors", []),
+            "low_confidence_sectors": issue_stats.get("low_confidence_sectors", []),
             "notes": [],
         }
 
@@ -229,31 +335,13 @@ def qc_from_outdir(
 
     totals = manifest.get("totals") or {}
     missing_count = totals.get("missing_sectors") or len(missing_sectors)
-    overall_status = "PASS"
-    reasons: list[str] = []
-    suggestions: list[str] = []
-
-    if missing_tracks:
-        overall_status = _worse_status(overall_status, "FAIL")
-        reasons.append(f"Missing tracks: {missing_tracks}")
-        suggestions.append("check SCP capture coverage or track mapping")
-
-    if missing_count:
-        overall_status = _worse_status(overall_status, "FAIL")
-        reasons.append(f"Missing sectors detected ({missing_count})")
-        suggestions.append("review reconstruct-disk output for gaps")
-
-    if crc_like_total > 0:
-        overall_status = _worse_status(overall_status, "WARN")
-        reasons.append("CRC-like integrity failures on reconstructed sectors")
-        suggestions.append("re-read media or verify checksums with another pass")
-
-    if no_decode_total > 0:
-        overall_status = _worse_status(overall_status, "WARN")
-        reasons.append(
-            "Un-decodable sectors present; capture/decoding limits suspected"
-        )
-        suggestions.append("inspect flux or adjust reconstruction parameters")
+    verdict = _reconstruction_verdict(
+        missing_tracks=missing_tracks,
+        missing_sectors=missing_sectors,
+        crc_fail_count=crc_like_total,
+        no_decode_count=no_decode_total,
+        low_conf_count=low_conf_total,
+    )
 
     classification = "unknown"
     if missing_count == 0:
@@ -278,13 +366,14 @@ def qc_from_outdir(
         "written_sectors": totals.get("written_sectors"),
     }
 
-    reason_payload = reasons or (
-        ["all checks passed"] if overall_status == "PASS" else []
+    reconstruction_qc["status"] = verdict["status"]
+    reason_payload = verdict["reasons"] or (
+        ["all checks passed"] if verdict["status"] == "PASS" else []
     )
     report["overall"] = {
-        "status": overall_status,
+        "status": verdict["status"],
         "reasons": reason_payload,
-        "suggestions": suggestions,
+        "suggestions": verdict["suggestions"],
     }
     report["reconstruction_qc"] = reconstruction_qc
     report["per_track"] = per_track_entries
@@ -339,7 +428,9 @@ def _hole_interval_metrics(
         if isinstance(sample, Sequence) and not hasattr(sample, "index_ticks"):
             groups = [list(map(int, grp)) for grp in intervals_by_rotation]
         else:
-            groups = [[int(getattr(rev, "index_ticks")) for rev in intervals_by_rotation]]
+            groups = [
+                [int(getattr(rev, "index_ticks")) for rev in intervals_by_rotation]
+            ]
 
     flat_intervals = [v for grp in groups for v in grp if v is not None]
     base_stats = _hole_interval_stats(flat_intervals)
@@ -400,8 +491,6 @@ def qc_from_scp(
     report["pipeline"] = ["capture_qc"]
     missing_tracks: list[int] = []
     per_track_entries: list[dict] = []
-    suggestions: list[str] = []
-    overall_status = "PASS"
     hole_interval_warn_tracks: list[tuple[int, float]] = []
     hole_interval_fail_tracks: list[tuple[int, float]] = []
     anomaly_tracks: list[tuple[int, dict]] = []
@@ -431,7 +520,9 @@ def qc_from_scp(
                     "track_step": None,
                     "used_fallback_track": False,
                     "flux_intervals_total": 0,
+                    "windows_total": 0,
                     "windows_captured": 0,
+                    "windows": 0,
                     "expected_windows": None,
                     "hole_interval": {"mean": None, "stdev": None, "cv": None},
                     "revs_estimated": None,
@@ -442,7 +533,6 @@ def qc_from_scp(
                     "notes": [str(exc)],
                 }
             )
-            overall_status = _worse_status(overall_status, "FAIL")
             continue
 
         track_data = image.read_track(scp_track_id)
@@ -452,7 +542,9 @@ def qc_from_scp(
                 {
                     "track": logical_track,
                     "flux_intervals_total": 0,
+                    "windows_total": 0,
                     "windows_captured": 0,
+                    "windows": 0,
                     "expected_windows": None,
                     "hole_interval": {"mean": None, "stdev": None, "cv": None},
                     "hole_interval_cv_noindex": None,
@@ -463,7 +555,6 @@ def qc_from_scp(
                     "notes": ["track not present in SCP"],
                 }
             )
-            overall_status = _worse_status(overall_status, "FAIL")
             continue
 
         flux_intervals_total = track_data.revolution_count
@@ -506,7 +597,13 @@ def qc_from_scp(
                 "track_step": step,
                 "used_fallback_track": used_fallback,
                 "flux_intervals_total": flux_intervals_total,
+                "windows_total": (
+                    windows_captured
+                    if windows_captured is not None
+                    else flux_intervals_total
+                ),
                 "windows_captured": windows_captured,
+                "windows": windows_captured,
                 "expected_windows": expected_windows,
                 "hole_interval": hole_interval,
                 "hole_interval_cv_noindex": hole_interval.get("cv_noindex"),
@@ -520,7 +617,6 @@ def qc_from_scp(
 
         if expected_windows and windows_captured is not None:
             if windows_captured < expected_windows * 0.9:
-                overall_status = _worse_status(overall_status, "WARN")
                 per_track_entries[-1]["status"] = "WARN"
                 missing_window_tracks.append(
                     (logical_track, windows_captured, expected_windows)
@@ -528,21 +624,14 @@ def qc_from_scp(
         hole_interval_cv = hole_interval.get("cv_noindex") or hole_interval.get("cv")
         if hole_interval_cv is not None:
             if hole_interval_cv >= HOLE_INTERVAL_FAIL_THRESHOLD:
-                overall_status = _worse_status(overall_status, "FAIL")
                 per_track_entries[-1]["status"] = "FAIL"
                 hole_interval_fail_tracks.append((logical_track, hole_interval_cv))
             elif hole_interval_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
-                overall_status = _worse_status(overall_status, "WARN")
                 per_track_entries[-1]["status"] = "WARN"
                 hole_interval_warn_tracks.append((logical_track, hole_interval_cv))
         if anomalies["dropouts"] or anomalies["noise"]:
-            overall_status = _worse_status(overall_status, "WARN")
             per_track_entries[-1]["status"] = "WARN"
             anomaly_tracks.append((logical_track, anomalies))
-
-    if missing_tracks:
-        overall_status = _worse_status(overall_status, "FAIL")
-        suggestions.append("verify capture head/side selection and track range")
 
     capture_qc = {
         "present_tracks": present_tracks,
@@ -607,13 +696,21 @@ def qc_from_scp(
                 f"dropouts={anomalies.get('dropouts', 0)} noise={anomalies.get('noise', 0)})"
             )
 
+    verdict = _capture_verdict(
+        missing_tracks=missing_tracks,
+        missing_window_tracks=missing_window_tracks,
+        hole_interval_warn_tracks=hole_interval_warn_tracks,
+        hole_interval_fail_tracks=hole_interval_fail_tracks,
+        anomaly_tracks=anomaly_tracks,
+    )
+    capture_qc["status"] = verdict["status"]
     reason_payload = reason_summaries or (
-        ["all checks passed"] if overall_status == "PASS" else []
+        verdict["reasons"] if verdict["reasons"] else ["all checks passed"]
     )
     report["overall"] = {
-        "status": overall_status,
+        "status": verdict["status"],
         "reasons": reason_payload,
-        "suggestions": suggestions,
+        "suggestions": verdict.get("suggestions", []),
     }
 
     report["per_track"] = per_track_entries
@@ -956,6 +1053,98 @@ def _track_issue_score(capture_entry: dict | None, recon_entry: dict | None) -> 
     )
 
 
+def _format_sector_list(values: Sequence[int], *, limit: int = 4) -> str:
+    if not values:
+        return ""
+    prefix = ",".join(f"S{val:02d}" for val in values[:limit])
+    if len(values) > limit:
+        prefix += f",+{len(values) - limit}"
+    return prefix
+
+
+def format_capture_issue(track_stats: dict) -> str:
+    parts: list[str] = []
+    expected = track_stats.get("expected_windows")
+    captured = track_stats.get("windows_captured")
+    if expected is not None and captured is not None and captured < expected:
+        parts.append(f"missing_windows={max(expected - captured, 0)}")
+
+    anomalies = track_stats.get("anomalies") or {}
+    dropouts = int(anomalies.get("dropouts") or 0)
+    noise = int(anomalies.get("noise") or 0)
+    if dropouts:
+        parts.append(f"dropouts={dropouts}")
+    if noise:
+        parts.append(f"noise={noise}")
+
+    hole_cv = track_stats.get("hole_interval_cv_noindex")
+    if hole_cv is None:
+        hole_cv = (track_stats.get("hole_interval") or {}).get("cv")
+    if hole_cv is not None and hole_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
+        parts.append(f"hole_cv={hole_cv:.3f}")
+
+    return ", ".join(parts)
+
+
+def format_recon_issue(track_stats: dict) -> str:
+    parts: list[str] = []
+    missing = len(track_stats.get("missing_sectors") or [])
+    if missing:
+        parts.append(f"missing={missing}")
+    crc_fail = int(track_stats.get("crc_fail") or 0)
+    crc_list = track_stats.get("crc_fail_sectors") or []
+    if crc_fail:
+        suffix = _format_sector_list(crc_list)
+        parts.append(f"crc_fail={crc_fail}" + (f" ({suffix})" if suffix else ""))
+    no_decode = int(track_stats.get("no_decode") or 0)
+    no_decode_list = track_stats.get("no_decode_sectors") or []
+    if no_decode:
+        suffix = _format_sector_list(no_decode_list)
+        parts.append(f"no_decode={no_decode}" + (f" ({suffix})" if suffix else ""))
+    low_conf = int(track_stats.get("low_confidence") or 0)
+    low_conf_list = track_stats.get("low_confidence_sectors") or []
+    if low_conf:
+        suffix = _format_sector_list(low_conf_list)
+        parts.append(f"low_conf={low_conf}" + (f" ({suffix})" if suffix else ""))
+
+    return ", ".join(parts)
+
+
+_SECTOR_CODE_EXPLANATIONS = {
+    "MISSING": "Sector payload not written to output directory",
+    "NO_DECODE": "Decoder could not recover data reliably",
+    "CRC_FAIL": "Recovered data failed integrity check",
+    "LOW_CONF": "Data recovered but confidence is low",
+}
+
+
+def format_sector_issue(
+    track: int, sector: int, code: str, detail: str | None = None
+) -> str:
+    explanation = _SECTOR_CODE_EXPLANATIONS.get(
+        code.upper(), "Sector flagged during reconstruction"
+    )
+    detail_note = f" ({detail})" if detail else ""
+    return f"  T{track:02d} S{sector:02d}: {code.upper()} — {explanation}{detail_note}"
+
+
+def _summarize_sector_failures(failures: Sequence[dict]) -> str:
+    if not failures:
+        return ""
+    labels = {
+        "CRC_FAIL": "crc_fail",
+        "NO_DECODE": "no_decode",
+        "MISSING": "missing",
+        "LOW_CONF": "low_conf",
+    }
+    counts: dict[str, int] = {}
+    for entry in failures:
+        code = (entry.get("code") or entry.get("status") or "").upper()
+        label = labels.get(code, code.lower())
+        counts[label] = counts.get(label, 0) + 1
+    return ", ".join(f"{value} {key}" for key, value in counts.items())
+
+
 def _build_track_maps(report: dict) -> tuple[dict[int, dict], dict[int, dict]]:
     capture_entries = report.get("capture_per_track") or report.get("per_track") or []
     recon_entries = report.get("reconstruction_per_track") or []
@@ -993,7 +1182,10 @@ def _has_hole_windows(capture: dict, entry: dict) -> bool:
         and entry.get("windows_captured") is not None
     ):
         return True
-    return entry.get("revs_estimated") is not None and entry.get("windows_captured") is not None
+    return (
+        entry.get("revs_estimated") is not None
+        and entry.get("windows_captured") is not None
+    )
 
 
 def _capture_noise_only(capture_report: dict) -> bool:
@@ -1027,10 +1219,15 @@ def _capture_noise_only(capture_report: dict) -> bool:
 
 
 def _format_capture_detail_lines(
-    capture: dict, *, status_only: bool = False, show_all: bool = False
+    capture: dict,
+    *,
+    status_only: bool = False,
+    show_all: bool = False,
+    mode: str | None = None,
 ) -> list[str]:
     tracks = capture.get("per_track") or []
     lines: list[str] = ["Capture QC (per track):"]
+    display_mode = (mode or capture.get("mode") or "").lower()
     if not tracks:
         lines.append("  (no capture data)")
         return lines
@@ -1045,7 +1242,7 @@ def _format_capture_detail_lines(
         expected_windows = entry.get("expected_windows")
         windows_label = "windows"
         window_desc = "n/a"
-        flux_intervals = entry.get("flux_intervals_total")
+        flux_intervals = entry.get("windows_total") or entry.get("flux_intervals_total")
         has_holes = _has_hole_windows(capture, entry)
         if has_holes:
             if expected_windows is not None:
@@ -1055,7 +1252,7 @@ def _format_capture_detail_lines(
             elif entry.get("windows_captured") is not None:
                 window_desc = str(entry.get("windows_captured"))
         else:
-            windows_label = "flux_intervals_total"
+            windows_label = "windows_total"
             if flux_intervals is not None:
                 window_desc = str(flux_intervals)
         hole_cv = entry.get("hole_interval_cv_noindex") if has_holes else None
@@ -1083,19 +1280,30 @@ def _format_capture_detail_lines(
         lines.append(line)
     if len(lines) == 1 and not show_all:
         lines.append("  (all tracks PASS; use --show-all-tracks to display)")
+    capture_status = (capture.get("status") or "PASS").upper()
     if len(lines) > 1:
         lines.append(
             "  Note: noise/dropout count heuristic flux anomalies; reconstruction QC"
             " indicates any decode impact."
         )
+    if display_mode == "detail" and capture_status in {"WARN", "FAIL"}:
+        lines.append(
+            "  What this means: capture noise/dropouts are heuristics; a PASS "
+            "reconstruction verdict means decoded sectors were unaffected."
+        )
     return lines
 
 
 def _format_reconstruction_detail_lines(
-    recon: dict, failure_cap: int = 200, *, show_all: bool = False
+    recon: dict,
+    failure_cap: int = 200,
+    *,
+    show_all: bool = False,
+    mode: str | None = None,
 ) -> list[str]:
     per_track = recon.get("per_track") or []
     lines = ["Reconstruction QC (per track):"]
+    display_mode = (mode or recon.get("mode") or "").lower()
     if not per_track:
         lines.append("  (no reconstruction data)")
         return lines
@@ -1124,15 +1332,25 @@ def _format_reconstruction_detail_lines(
 
     failures = recon.get("per_sector_failures") or []
     if failures:
-        lines.append("Sector failures:")
-        for entry in failures[:failure_cap]:
-            lines.append(
-                f"  T{int(entry.get('track', -1)):02d} S{int(entry.get('sector', -1)):02d} "
-                f"{entry.get('status', '').upper()} = {entry.get('code', entry.get('status'))}"
-                + (f" ({entry.get('detail')})" if entry.get("detail") else "")
-            )
-        if len(failures) > failure_cap:
-            lines.append(f"  ...and {len(failures) - failure_cap} more")
+        if display_mode == "detail":
+            lines.append("Sector failures:")
+            for entry in failures[:failure_cap]:
+                lines.append(
+                    format_sector_issue(
+                        int(entry.get("track", -1)),
+                        int(entry.get("sector", -1)),
+                        str(entry.get("code") or entry.get("status") or "issue"),
+                        entry.get("detail"),
+                    )
+                )
+            if len(failures) > failure_cap:
+                lines.append(f"  ...and {len(failures) - failure_cap} more")
+        else:
+            summary = _summarize_sector_failures(failures)
+            if summary:
+                lines.append(f"  Failures: {summary} (see --mode detail)")
+    elif display_mode != "detail":
+        lines.append("  Reconstruction clean.")
     return lines
 
 
@@ -1146,10 +1364,11 @@ def _summarize_reconstruction_line(report: dict) -> str:
     crc_fail = recon.get("crc_fail_count", 0)
     no_decode = recon.get("no_decode_count", 0)
     low_conf = recon.get("low_confidence_count", 0)
+    status = (recon.get("status") or "PASS").upper()
     return (
-        "Reconstruction: "
-        + f"{written}/{expected} sectors, crc_fail={crc_fail}, "
-        + f"no_decode={no_decode}, missing={missing}, low_conf={low_conf}"
+        f"Reconstruction verdict: {status} — "
+        f"{written}/{expected} sectors; missing={missing}, no_decode={no_decode}, "
+        f"crc_fail={crc_fail}, low_conf={low_conf}"
     )
 
 
@@ -1165,8 +1384,13 @@ def _summarize_capture_line(report: dict) -> str:
         for entry in tracks
         if entry.get("windows_captured") is not None
     )
-    flux_intervals_total = sum(
-        int(entry.get("flux_intervals_total") or 0) for entry in tracks
+    windows_total = sum(
+        int(
+            entry.get("windows_total")
+            if entry.get("windows_total") is not None
+            else entry.get("flux_intervals_total") or 0
+        )
+        for entry in tracks
     )
     expected_list = [
         entry.get("expected_windows")
@@ -1179,21 +1403,22 @@ def _summarize_capture_line(report: dict) -> str:
     dropout_windows = sum(int(a.get("dropouts") or 0) for a in anomalies)
     holes_known = capture.get("holes_per_rotation_effective") is not None
     windows_known = any(entry.get("windows_captured") is not None for entry in tracks)
-    window_total = windows_captured if windows_known else flux_intervals_total
+    window_total = windows_captured if windows_known else windows_total
     expected_str = str(expected_total) if expected_total is not None else None
     windows_label = "windows"
     if (not holes_known and expected_total is None) or not windows_known:
-        windows_label = "flux_intervals_total"
+        windows_label = "windows_total"
         expected_str = None
     if expected_str is None:
         window_desc = str(window_total)
     else:
         window_desc = f"{window_total}/{expected_str}"
+    status = (capture.get("status") or "PASS").upper()
     return (
-        "Capture: "
-        + f"tracks present={present_count} missing={missing_tracks}, "
-        + f"{windows_label}={window_desc}, noise_windows={noise_windows}, "
-        + f"dropout_windows={dropout_windows}"
+        f"Capture verdict: {status} — "
+        f"tracks present={present_count} missing={missing_tracks}, "
+        f"{windows_label}={window_desc}, noise_windows={noise_windows}, "
+        f"dropout_windows={dropout_windows}"
     )
 
 
@@ -1205,53 +1430,26 @@ def _format_top_issues_line(report: dict, limit: int = 5) -> str:
     if mode == "detail":
         formatted = []
         for track_id, score, capture_entry, recon_entry in top_tracks:
-            missing = len((recon_entry or {}).get("missing_sectors") or [])
-            crc_fail = (recon_entry or {}).get("crc_fail", 0)
-            no_decode = (recon_entry or {}).get("no_decode", 0)
-            low_conf = (recon_entry or {}).get("low_confidence", 0)
-            anomalies = (capture_entry or {}).get("anomalies") or {}
-            timing_cv = (capture_entry or {}).get("hole_interval_cv_noindex")
-            timing_note = "" if timing_cv is None else f", timing_cv={timing_cv:.3f}"
+            capture_issue = format_capture_issue(capture_entry or {})
+            recon_issue = format_recon_issue(recon_entry or {})
+            parts = []
+            if recon_issue:
+                parts.append(f"recon: {recon_issue}")
+            if capture_issue:
+                parts.append(f"capture: {capture_issue}")
             formatted.append(
-                f"T{track_id:02d} (score={score}; missing={missing} no_decode={no_decode} crc_fail={crc_fail} "
-                f"low_conf={low_conf} noise={anomalies.get('noise', 0)} dropouts={anomalies.get('dropouts', 0)}{timing_note})"
+                f"T{track_id:02d} (score={score}): "
+                + (" | ".join(parts) if parts else "issue detected")
             )
         return "Top issues: " + ", ".join(formatted)
 
     def _brief_issue_token(capture_entry: dict | None, recon_entry: dict | None) -> str:
-        if recon_entry:
-            missing = len(recon_entry.get("missing_sectors") or [])
-            if missing:
-                return f"missing={missing}"
-            no_decode = int(recon_entry.get("no_decode") or 0)
-            if no_decode:
-                return f"no_decode={no_decode}"
-            crc_fail = int(recon_entry.get("crc_fail") or 0)
-            if crc_fail:
-                return f"crc_fail={crc_fail}"
-            low_conf = int(recon_entry.get("low_confidence") or 0)
-            if low_conf:
-                return f"low_conf={low_conf}"
-
-        if capture_entry:
-            anomalies = capture_entry.get("anomalies") or {}
-            dropouts = int(anomalies.get("dropouts") or 0)
-            noise = int(anomalies.get("noise") or 0)
-            expected = capture_entry.get("expected_windows")
-            captured = capture_entry.get("windows_captured") or 0
-            if expected is not None and captured < expected:
-                missing = max(expected - captured, 0)
-                return f"missing_windows={missing}"
-            if dropouts:
-                return f"dropouts={dropouts}"
-            if noise:
-                return f"noise={noise}"
-            hole_cv = capture_entry.get("hole_interval_cv_noindex")
-            if hole_cv is None:
-                hole_cv = (capture_entry.get("hole_interval") or {}).get("cv")
-            if hole_cv is not None and hole_cv >= HOLE_INTERVAL_WARN_THRESHOLD:
-                return f"hole_cv={hole_cv:.3f}"
-
+        recon_issue = (format_recon_issue(recon_entry or {}) or "").split(",")
+        capture_issue = (format_capture_issue(capture_entry or {}) or "").split(",")
+        if recon_issue and recon_issue[0]:
+            return recon_issue[0].strip()
+        if capture_issue and capture_issue[0]:
+            return capture_issue[0].strip()
         return "issue"
 
     compact = [
@@ -1287,7 +1485,10 @@ def format_reconstruction_report(
     )
     lines.extend(
         _format_reconstruction_detail_lines(
-            recon_detail, failure_cap=failure_cap, show_all=show_all
+            recon_detail,
+            failure_cap=failure_cap,
+            show_all=show_all,
+            mode=report.get("mode"),
         )
     )
     lines.append(_format_top_issues_line(report, limit=limit))
@@ -1304,7 +1505,7 @@ def format_capture_report(
     lines.append(_summarize_capture_line(report))
     lines.extend(
         _format_capture_detail_lines(
-            report.get("capture_qc") or {}, show_all=show_all
+            report.get("capture_qc") or {}, show_all=show_all, mode=report.get("mode")
         )
     )
     lines.append(_format_top_issues_line(report, limit=limit))
@@ -1323,7 +1524,9 @@ def format_detail_summary(report: dict, limit: int = 5) -> str:
         lines.append("")
         lines.extend(
             _format_capture_detail_lines(
-                report.get("capture_qc") or {}, show_all=show_all
+                report.get("capture_qc") or {},
+                show_all=show_all,
+                mode=report.get("mode"),
             )
         )
         lines.append("")
@@ -1340,7 +1543,7 @@ def format_detail_summary(report: dict, limit: int = 5) -> str:
             or [],
         )
         recon_section = _format_reconstruction_detail_lines(
-            recon_detail, failure_cap=200, show_all=show_all
+            recon_detail, failure_cap=200, show_all=show_all, mode=report.get("mode")
         )
         lines.extend(recon_section)
 
