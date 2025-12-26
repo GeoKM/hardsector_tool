@@ -610,9 +610,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     scan.add_argument("out_dir", type=Path, help="Reconstruction output directory")
     scan.add_argument("--out", required=True, type=Path, help="Output JSON path")
 
-    from . import extractmods
+    from . import catalog_report, extractmods
 
     extractmods.build_arg_parser(subparsers)
+    catalog_report.build_arg_parser(subparsers)
 
     qc = subparsers.add_parser(
         "qc-capture",
@@ -793,6 +794,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             only_prefix=only_prefix,
             only_prefix_norm=prefix_norm,
             dry_run=args.dry_run,
+            force=args.force,
+        )
+        return 0
+
+    if args.command == "catalog-report":
+        from . import catalog_report
+
+        hypotheses = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
+        only_prefix = args.only_prefix.strip() if args.only_prefix else None
+        prefix_norm = only_prefix.lstrip("=") if only_prefix else None
+        sector_sizes = _parse_sector_sizes(args.sector_sizes)
+        tracks = _parse_track_range(args.tracks) if args.tracks else None
+        catalog_report.catalog_report(
+            args.input,
+            out_dir=args.out,
+            min_refs=args.min_refs,
+            max_refs=args.max_refs,
+            hypotheses=hypotheses,
+            enable_pppp_descriptors=args.enable_pppp_descriptors,
+            pppp_span_sectors=max(0, args.pppp_span_sectors),
+            require_name_in_pppp_list=args.require_name_in_pppp_list,
+            only_prefix=only_prefix,
+            only_prefix_norm=prefix_norm,
+            tracks=tracks,
+            side=args.side,
+            track_step=args.track_step,
+            logical_sectors=args.logical_sectors,
+            sectors_per_rotation=args.sectors_per_rotation,
+            sector_sizes=sector_sizes,
+            keep_best=args.keep_best,
+            similarity_threshold=args.similarity_threshold,
+            clock_factor=args.clock_factor,
+            dump_raw_windows=args.dump_raw_windows,
+            cache_dir=args.cache_dir,
+            force_reconstruct=args.force_reconstruct,
+            reconstruct_out=args.reconstruct_out,
             force=args.force,
         )
         return 0

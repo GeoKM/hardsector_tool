@@ -233,6 +233,23 @@ python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen \
 
 Optional pppp-based descriptor carving (if your hypothesis suggests names-with-pointers sitting in `pppp=` records) can be toggled with `--enable-pppp-descriptors`, with `--pppp-span-sectors` controlling whether to include bytes from the next sector when parsing those entries.
 
+### Catalog reporting (evidence-only)
+
+`catalog-report` inventories descriptor-backed module candidates and name lists without writing payloads. It reuses the reconstruction cache used by `qc-capture` so running against an SCP image will transparently reconstruct into `.qc_cache/` (unless `--reconstruct-out` or `--force-reconstruct` is set). Outputs are written to `catalog_report.json` and `catalog_report.txt` inside the `--out` directory.
+
+Examples:
+
+```bash
+# From an SCP image (reconstruction cached under .qc_cache/ by default)
+python -m hardsector_tool catalog-report tests/ACMS80217/ACMS80217-HS32.scp --out reports/acms80217 --cache-dir .qc_cache
+
+# From an existing reconstruction directory
+python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_80217_v3
+
+# Filtered view requiring names to appear in pppp lists
+python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_sysgen --only-prefix SYSGEN. --require-name-in-pppp-list --enable-pppp-descriptors
+```
+
 ---
 
 ## Help / discoverability
@@ -242,15 +259,18 @@ python -m hardsector_tool --help
 python -m hardsector_tool scan-metadata --help
 python -m hardsector_tool reconstruct-disk --help
 python -m hardsector_tool extract-modules --help
+python -m hardsector_tool catalog-report --help
 ```
 
-**Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules,qc-capture}`
+**Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules,catalog-report,qc-capture}`
 
 **reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
 
 **scan-metadata options:** `--out OUT out_dir`
 
 **extract-modules options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, `--dry-run`, `--force`
+
+**catalog-report options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, reconstruction toggles for SCP inputs (`--cache-dir`, `--force-reconstruct`, `--reconstruct-out`, `--tracks`, `--side`, `--track-step`, `--logical-sectors`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--force`)
 
 **qc-capture options:** `--mode {brief,detail}`, `--tracks`, `--side`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--revs`, `--cache-dir`, `--reconstruct-out`, `--force`, `--reconstruct/--no-reconstruct`, `--reconstruct-verbose`, `--logical-sectors`, `--reconstruct-sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--show-all-tracks`
 
