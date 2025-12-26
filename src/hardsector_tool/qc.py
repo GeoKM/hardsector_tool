@@ -1147,7 +1147,10 @@ def _format_sector_failures(
             int(entry.get("sector", -1)),
         ),
     )
-    lines = [f"Sector failures ({len(sorted_failures)}):"]
+    lines = [
+        f"Sector failures: {len(sorted_failures)} issue(s) recorded",
+        f"Sector failures ({len(sorted_failures)}):",
+    ]
     for entry in sorted_failures[:display_limit]:
         lines.append(
             format_sector_issue(
@@ -1304,7 +1307,7 @@ def _format_capture_detail_lines(
         lines.append(
             "  Legend: windows=captured hard-sector windows; index_gap_ratio=index gap to"
             " hard-sector spacing; hole_cv_noindex=timing jitter across holes; "
-            "noise/dropouts=heuristic flux anomaly counts."
+            "noise/dropouts=heuristic flux anomalies (counts)."
         )
     if display_mode == "detail" and capture_status in {"WARN", "FAIL"}:
         lines.append(
@@ -1366,6 +1369,7 @@ def _format_reconstruction_detail_lines(
         failures, display_limit=min(failure_cap, 80)
     )
     if sector_failure_lines:
+        lines.append("Failures:")
         lines.extend(sector_failure_lines)
     elif display_mode != "detail":
         lines.append("  No sector failures detected.")
