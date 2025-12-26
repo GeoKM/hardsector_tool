@@ -1111,10 +1111,10 @@ def format_recon_issue(track_stats: dict) -> str:
 
 
 _SECTOR_CODE_EXPLANATIONS = {
-    "MISSING": "Sector payload not written to output directory",
-    "NO_DECODE": "Decoder could not recover data reliably",
-    "CRC_FAIL": "Recovered data failed integrity check",
-    "LOW_CONF": "Data recovered but confidence is low",
+    "MISSING": "no sector output written (incomplete reconstruction)",
+    "NO_DECODE": "could not reconstruct stable sector (likely deeper signal/format issue)",
+    "CRC_FAIL": "decoded but failed integrity check (suggest recapture / more revs)",
+    "LOW_CONF": "sector recovered with low confidence (unstable flux / weak signal)",
 }
 
 
@@ -1128,21 +1128,40 @@ def format_sector_issue(
     return f"  T{track:02d} S{sector:02d}: {code.upper()} — {explanation}{detail_note}"
 
 
-def _summarize_sector_failures(failures: Sequence[dict]) -> str:
-    if not failures:
-        return ""
-    labels = {
-        "CRC_FAIL": "crc_fail",
-        "NO_DECODE": "no_decode",
-        "MISSING": "missing",
-        "LOW_CONF": "low_conf",
-    }
-    counts: dict[str, int] = {}
-    for entry in failures:
-        code = (entry.get("code") or entry.get("status") or "").upper()
-        label = labels.get(code, code.lower())
-        counts[label] = counts.get(label, 0) + 1
-    return ", ".join(f"{value} {key}" for key, value in counts.items())
+def _format_sector_failures(
+    failures: Sequence[dict], *, display_limit: int = 80
+) -> list[str]:
+    filtered: list[dict] = []
+    for failure in failures:
+        code = (failure.get("code") or failure.get("status") or "").upper()
+        if code and code not in {"PASS", "OK"}:
+            filtered.append(failure)
+
+    if not filtered:
+        return []
+
+    sorted_failures = sorted(
+        filtered,
+        key=lambda entry: (
+            int(entry.get("track", -1)),
+            int(entry.get("sector", -1)),
+        ),
+    )
+    lines = [f"Sector failures ({len(sorted_failures)}):"]
+    for entry in sorted_failures[:display_limit]:
+        lines.append(
+            format_sector_issue(
+                int(entry.get("track", -1)),
+                int(entry.get("sector", -1)),
+                str(entry.get("code") or entry.get("status") or "issue"),
+                entry.get("detail"),
+            )
+        )
+    if len(sorted_failures) > display_limit:
+        lines.append(
+            f"  (... +{len(sorted_failures) - display_limit} more; see JSON for full list)"
+        )
+    return lines
 
 
 def _build_track_maps(report: dict) -> tuple[dict[int, dict], dict[int, dict]]:
@@ -1283,13 +1302,19 @@ def _format_capture_detail_lines(
     capture_status = (capture.get("status") or "PASS").upper()
     if len(lines) > 1:
         lines.append(
-            "  Note: noise/dropout count heuristic flux anomalies; reconstruction QC"
-            " indicates any decode impact."
+            "  Legend: windows=captured hard-sector windows; index_gap_ratio=index gap to"
+            " hard-sector spacing; hole_cv_noindex=timing jitter across holes; "
+            "noise/dropouts=heuristic flux anomaly counts."
         )
     if display_mode == "detail" and capture_status in {"WARN", "FAIL"}:
         lines.append(
-            "  What this means: capture noise/dropouts are heuristics; a PASS "
-            "reconstruction verdict means decoded sectors were unaffected."
+            "  Note: capture noise/dropouts are flux-level heuristics; reconstruction QC"
+            " shows whether they impacted sector recovery."
+        )
+    else:
+        lines.append(
+            "  Note: capture noise/dropouts are flux-level heuristics; reconstruction QC"
+            " shows whether they impacted sector recovery."
         )
     return lines
 
@@ -1304,53 +1329,46 @@ def _format_reconstruction_detail_lines(
     per_track = recon.get("per_track") or []
     lines = ["Reconstruction QC (per track):"]
     display_mode = (mode or recon.get("mode") or "").lower()
+    track_lines_added = bool(per_track)
     if not per_track:
         lines.append("  (no reconstruction data)")
-        return lines
-
-    for entry in per_track:
-        missing = len(entry.get("missing_sectors") or [])
-        crc_fail = entry.get("crc_fail", 0)
-        no_decode = entry.get("no_decode", 0)
-        low_conf = entry.get("low_confidence", 0)
-        status = "PASS"
-        if missing or crc_fail or no_decode:
-            status = "FAIL"
-        elif low_conf:
-            status = "WARN"
-        if status == "PASS" and not show_all:
-            continue
-        line = (
-            f"  T{int(entry.get('track', -1)):02d}: sectors={entry.get('sectors_present', 0)}/"
-            f"{entry.get('sectors_expected')} missing={missing} crc_fail={entry.get('crc_fail', 0)} "
-            f"no_decode={entry.get('no_decode', 0)} low_conf={entry.get('low_confidence', 0)}"
-        )
-        lines.append(line)
+    else:
+        for entry in per_track:
+            missing = len(entry.get("missing_sectors") or [])
+            crc_fail = entry.get("crc_fail", 0)
+            no_decode = entry.get("no_decode", 0)
+            low_conf = entry.get("low_confidence", 0)
+            status = "PASS"
+            if missing or crc_fail or no_decode:
+                status = "FAIL"
+            elif low_conf:
+                status = "WARN"
+            if status == "PASS" and not show_all:
+                continue
+            line = (
+                f"  T{int(entry.get('track', -1)):02d}: sectors={entry.get('sectors_present', 0)}/"
+                f"{entry.get('sectors_expected')} missing={missing} crc_fail={entry.get('crc_fail', 0)} "
+                f"no_decode={entry.get('no_decode', 0)} low_conf={entry.get('low_confidence', 0)}"
+            )
+            lines.append(line)
 
     if len(lines) == 1 and not show_all:
         lines.append("  (all tracks PASS; use --show-all-tracks to display)")
 
+    if len(lines) > 1 and track_lines_added:
+        lines.append(
+            "  Legend: missing=sectors absent; no_decode=sectors not decoded; "
+            "crc_fail=decoded but failed integrity; low_conf=decoded with low confidence."
+        )
+
     failures = recon.get("per_sector_failures") or []
-    if failures:
-        if display_mode == "detail":
-            lines.append("Sector failures:")
-            for entry in failures[:failure_cap]:
-                lines.append(
-                    format_sector_issue(
-                        int(entry.get("track", -1)),
-                        int(entry.get("sector", -1)),
-                        str(entry.get("code") or entry.get("status") or "issue"),
-                        entry.get("detail"),
-                    )
-                )
-            if len(failures) > failure_cap:
-                lines.append(f"  ...and {len(failures) - failure_cap} more")
-        else:
-            summary = _summarize_sector_failures(failures)
-            if summary:
-                lines.append(f"  Failures: {summary} (see --mode detail)")
+    sector_failure_lines = _format_sector_failures(
+        failures, display_limit=min(failure_cap, 80)
+    )
+    if sector_failure_lines:
+        lines.extend(sector_failure_lines)
     elif display_mode != "detail":
-        lines.append("  Reconstruction clean.")
+        lines.append("  No sector failures detected.")
     return lines
 
 
@@ -1518,6 +1536,18 @@ def format_detail_summary(report: dict, limit: int = 5) -> str:
     lines.append(summarize_qc(report))
     lines.append(_summarize_reconstruction_line(report))
     lines.append(_summarize_capture_line(report))
+    if report.get("mode") != "detail":
+        failures = (
+            (report.get("reconstruction_qc") or {}).get("per_sector_failures")
+            or report.get("reconstruction_per_sector")
+            or report.get("per_sector")
+            or []
+        )
+        sector_lines = _format_sector_failures(failures)
+        if sector_lines:
+            lines.extend(sector_lines)
+        elif report.get("reconstruction_qc"):
+            lines.append("Sector failures: none detected.")
     lines.append(_format_top_issues_line(report, limit=limit))
 
     if report.get("mode") == "detail":
