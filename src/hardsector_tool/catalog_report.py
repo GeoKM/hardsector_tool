@@ -501,7 +501,7 @@ def _ensure_reconstruction(
 def catalog_report(
     input_path: Path,
     *,
-    out_dir: Path,
+    out_dir: Path | None = None,
     min_refs: int = 3,
     max_refs: int = 2000,
     hypotheses: Iterable[str] = ("H1", "H2", "H3", "H4"),
@@ -526,8 +526,8 @@ def catalog_report(
     force: bool = False,
 ) -> dict:
     input_path = Path(input_path)
-    out_dir = Path(out_dir)
-    _safe_mkdir(out_dir)
+    output_dir = Path(out_dir) if out_dir is not None else None
+    cache_root = cache_dir if cache_dir is not None else Path(".qc_cache")
 
     if input_path.suffix.lower() == ".scp":
         recon_dir, used_cache = _ensure_reconstruction(
@@ -542,22 +542,24 @@ def catalog_report(
             similarity_threshold=similarity_threshold,
             clock_factor=clock_factor,
             dump_raw_windows=dump_raw_windows,
-            cache_dir=cache_dir or Path(".qc_cache"),
+            cache_dir=cache_root,
             force_reconstruct=force_reconstruct,
             reconstruct_out=reconstruct_out,
             force=force,
         )
         input_type = "scp"
         holes_per_rev = sectors_per_rotation
-        cache_note = {
-            "cache_dir": str(cache_dir or Path(".qc_cache")),
-            "used_cache": used_cache,
-        }
+        cache_note = {"cache_dir": str(cache_root), "used_cache": used_cache}
     else:
         recon_dir = input_path
         input_type = "reconstruction"
         holes_per_rev = sectors_per_rotation
         cache_note = {"cache_dir": None, "used_cache": False}
+
+    report_out_dir = (
+        output_dir if output_dir is not None else recon_dir / "catalog_report"
+    )
+    _safe_mkdir(report_out_dir)
 
     report = generate_catalog_report(
         recon_dir,
@@ -574,8 +576,8 @@ def catalog_report(
         holes_per_rev=holes_per_rev,
     )
 
-    json_path = out_dir / "catalog_report.json"
-    txt_path = out_dir / "catalog_report.txt"
+    json_path = report_out_dir / "catalog_report.json"
+    txt_path = report_out_dir / "catalog_report.txt"
 
     json_payload = report["json"]
     json_payload["reconstruction_cache"] = cache_note
@@ -597,7 +599,14 @@ def build_arg_parser(
         help="Generate an evidence-backed catalog listing from reconstructed sectors",
     )
     parser.add_argument("input", type=Path, help="SCP image or reconstruction output")
-    parser.add_argument("--out", required=True, type=Path, help="Output directory")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help=(
+            "Output directory. Default: reconstruction path under catalog_report/ "
+            "(or cache reconstruction for SCP inputs)."
+        ),
+    )
     parser.add_argument(
         "--min-refs", type=int, default=3, help="Minimum pointer references to accept"
     )
@@ -633,7 +642,7 @@ def build_arg_parser(
         "--cache-dir",
         type=Path,
         default=Path(".qc_cache"),
-        help="Cache directory for reconstruction outputs (SCP inputs)",
+        help="Cache directory for reconstruction outputs (shared with qc-capture)",
     )
     parser.add_argument(
         "--force-reconstruct",

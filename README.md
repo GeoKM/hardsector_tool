@@ -146,6 +146,10 @@ python -m hardsector_tool scan-metadata out_80221_v3 --out scan_80221.json
 python -m hardsector_tool scan-metadata out_80217_v3 --out scan_80217.json
 ```
 
+`scan-metadata` accepts track diagnostics named either `tracks/track_XX.json` or
+`tracks/TXX.json`. When per-track JSONs are missing or lack a sector size,
+sector payload sizes are sampled to infer the most common logical sector size.
+
 Use the JSON to guide reverse engineering (what sectors look like labels/catalogs/manifests).
 
 ---
@@ -235,7 +239,7 @@ Optional pppp-based descriptor carving (if your hypothesis suggests names-with-p
 
 ### Catalog reporting (evidence-only)
 
-`catalog-report` inventories descriptor-backed module candidates and name lists without writing payloads. It reuses the reconstruction cache used by `qc-capture` so running against an SCP image will transparently reconstruct into `.qc_cache/` (unless `--reconstruct-out` or `--force-reconstruct` is set). Outputs are written to `catalog_report.json` and `catalog_report.txt` inside the `--out` directory.
+`catalog-report` inventories descriptor-backed module candidates and name lists without writing payloads. It reuses the reconstruction cache used by `qc-capture` so running against an SCP image will transparently reconstruct into `.qc_cache/` (unless `--reconstruct-out` or `--force-reconstruct` is set). If `--out` is omitted, reports land in `<reconstruction>/catalog_report/` (or the cache reconstruction directory for SCP inputs); otherwise `catalog_report.json` and `catalog_report.txt` are written under the chosen `--out` path.
 
 Examples:
 
@@ -249,6 +253,11 @@ python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_80217_v3
 # Filtered view requiring names to appear in pppp lists
 python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_sysgen --only-prefix SYSGEN. --require-name-in-pppp-list --enable-pppp-descriptors
 ```
+
+Notes:
+
+* SCP inputs reuse the `.qc_cache/` reconstruction cache (shared with `qc-capture`) unless you force a rerun.
+* If `--out` is omitted, catalog reports are written under `<reconstruction>/catalog_report/` (for SCP inputs this is the cache reconstruction directory).
 
 ---
 
@@ -332,7 +341,7 @@ This is intentional: it prevents name lists from inflating descriptor counts and
 
 * `manifest.json` — totals, mapping, track stats
 * `sectors/Txx_Syy.bin` — recovered logical sector payloads (primary analysis artifact)
-* `tracks/track_XX.json` — per-track decode diagnostics
+* `tracks/track_XX.json` or `tracks/TXX.json` — per-track decode diagnostics
 
 ### Extract output (`derived_*`)
 

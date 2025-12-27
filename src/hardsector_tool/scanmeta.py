@@ -56,15 +56,41 @@ def _load_sector(
     )
 
 
-def _sector_size_for_track(track: int, out_dir: Path, default: int) -> int:
-    track_path = out_dir / "tracks" / f"T{track:02d}.json"
-    if track_path.exists():
+def _sector_size_for_track(
+    out_dir: Path, track: int, default_sector_size: int = 256
+) -> tuple[int, str]:
+    """Infer sector size for a track using track JSON or sector payloads."""
+
+    track_json_candidates = [
+        out_dir / "tracks" / f"track_{track:02d}.json",
+        out_dir / "tracks" / f"T{track:02d}.json",
+    ]
+
+    for track_path in track_json_candidates:
+        if not track_path.exists():
+            continue
         try:
             data = json.loads(track_path.read_text())
-            return int(data.get("sector_size", default) or default)
-        except (json.JSONDecodeError, OSError, ValueError):
-            return default
-    return default
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        for key in ("selected_sector_size", "sector_size", "best_sector_size"):
+            if key not in data:
+                continue
+            try:
+                return int(data[key]), "track_json"
+            except (TypeError, ValueError):
+                continue
+
+    sector_files = list((out_dir / "sectors").glob(f"T{track:02d}_S*.bin"))
+    if sector_files:
+        size_counts = Counter(path.stat().st_size for path in sector_files)
+        max_count = max(size_counts.values())
+        candidates = [size for size, count in size_counts.items() if count == max_count]
+        chosen = max(candidates)
+        return chosen, "sector_files"
+
+    return default_sector_size, "default"
 
 
 def _slice_context(payload: bytes, offset: int, radius: int = 32) -> tuple[str, str]:
@@ -242,8 +268,12 @@ def scan_metadata(out_dir: Path) -> dict:
 
     sectors: list[SectorData] = []
     missing: list[str] = []
+    inferred_sizes: list[tuple[int, str]] = []
     for track in expected_tracks:
-        sector_size = _sector_size_for_track(track, out_dir, default_sector_size)
+        sector_size, size_source = _sector_size_for_track(
+            out_dir, track, default_sector_size
+        )
+        inferred_sizes.append((sector_size, size_source))
         for sector in range(logical_sectors):
             entry = _load_sector(track, sector, out_dir, sector_size)
             if entry is None:
@@ -251,10 +281,26 @@ def scan_metadata(out_dir: Path) -> dict:
                 continue
             sectors.append(entry)
 
+    sector_size_inferred = default_sector_size
+    sector_size_source = "default"
+    if inferred_sizes:
+        size_counts = Counter(size for size, _ in inferred_sizes)
+        max_count = max(size_counts.values())
+        candidates = [size for size, count in size_counts.items() if count == max_count]
+        sector_size_inferred = max(candidates)
+        source_priority = {"track_json": 2, "sector_files": 1, "default": 0}
+        for size, source in inferred_sizes:
+            if size == sector_size_inferred and source_priority.get(
+                source, -1
+            ) >= source_priority.get(sector_size_source, -1):
+                sector_size_source = source
+
     summary = {
         "tracks": len(expected_tracks),
         "sectors_per_track": logical_sectors,
-        "sector_size": default_sector_size,
+        "sector_size": sector_size_inferred,
+        "sector_size_inferred": sector_size_inferred,
+        "sector_size_source": sector_size_source,
         "manifest_totals": manifest.get("totals", {}),
         "missing": missing,
     }
