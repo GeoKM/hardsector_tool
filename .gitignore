@@ -211,3 +211,9 @@ __marimo__/
 
 # Output artifacts
 decoded/
+tests/ACMS80217/
+tests/ACMS80221/
+.qc_cache/
+8-00014-OIS_100-Software/
+8-00015-Other-HS32-Software/
+src.zip
