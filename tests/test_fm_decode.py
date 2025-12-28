@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from conftest import require_fixture
 from hardsector_tool.fm import (
     best_aligned_bytes,
     brute_force_mark_payloads,
@@ -14,7 +17,9 @@ from hardsector_tool.fm import (
 )
 from hardsector_tool.scp import SCPImage
 
-FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
+pytestmark = pytest.mark.slow
+
+FIXTURE = require_fixture(Path("tests/ACMS80217/ACMS80217-HS32.scp"))
 
 
 def test_fm_decode_produces_bytes() -> None:

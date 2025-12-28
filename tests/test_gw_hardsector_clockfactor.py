@@ -1,10 +1,16 @@
 from pathlib import Path
 
+from pathlib import Path
+
 import pytest
 
+from conftest import require_fixture
 from hardsector_tool.fm import pll_decode_fm_bytes
 from hardsector_tool.hardsector import payload_metrics
 from hardsector_tool.scp import SCPImage
+
+
+pytestmark = pytest.mark.slow
 
 
 FIXTURES = [
@@ -19,8 +25,7 @@ FIXTURES = [
     ids=[path.parent.name for path in FIXTURES],
 )
 def test_clock_factor_one_increases_entropy(scp_path: Path) -> None:
-    if not scp_path.exists():
-        pytest.skip(f"Fixture not present: {scp_path}")
+    scp_path = require_fixture(scp_path)
 
     image = SCPImage.from_file(scp_path)
     track = image.read_track(0)

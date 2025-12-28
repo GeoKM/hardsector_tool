@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from conftest import require_fixture
 from hardsector_tool.hardsector import (
     FORMAT_PRESETS,
     best_sector_map,
@@ -9,12 +12,16 @@ from hardsector_tool.hardsector import (
 )
 from hardsector_tool.scp import RevolutionEntry, SCPImage, TrackData
 
+pytestmark = pytest.mark.slow
+
 FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
 FIXTURE_221 = Path("tests/ACMS80221/ACMS80221-HS32.scp")
 
 
 def test_grouping_matches_expected_rotations() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
@@ -28,7 +35,9 @@ def test_grouping_matches_expected_rotations() -> None:
 
 
 def test_grouping_pairs_holes_into_logical_sectors() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
@@ -40,7 +49,9 @@ def test_grouping_pairs_holes_into_logical_sectors() -> None:
 
 
 def test_detects_short_pair_position() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
@@ -53,7 +64,9 @@ def test_detects_short_pair_position() -> None:
 
 
 def test_short_pair_position_other_fixture() -> None:
-    image = SCPImage.from_file(FIXTURE_221)
+    fixture = require_fixture(FIXTURE_221)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
@@ -154,7 +167,9 @@ def test_merges_shortest_adjacent_intervals() -> None:
 
 
 def test_normalization_yields_single_index_pair_per_rotation() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
