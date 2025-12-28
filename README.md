@@ -152,6 +152,14 @@ sector payload sizes are sampled to infer the most common logical sector size.
 
 Use the JSON to guide reverse engineering (what sectors look like labels/catalogs/manifests).
 
+`scan-metadata` can also flag sectors that look like packed UI/message tables (dense printable strings, revision markers, domain
+keywords such as “archive”/“checkout”/“diagnostic”). This is **evidence extraction** for disks that may not surface catalog
+names but clearly contain prompts. To export the strings it finds (by default only from candidate sectors), use:
+
+```bash
+python -m hardsector_tool scan-metadata out_80217_v3 --out scan_80217.json --messages-out messages.tsv
+```
+
 ---
 
 ### Step 3 — Experimental “module extraction” (carving with provenance)
@@ -275,7 +283,8 @@ python -m hardsector_tool catalog-report --help
 
 **reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
 
-**scan-metadata options:** `--out OUT out_dir`
+**scan-metadata options:** `--out OUT out_dir` plus message-catalog toggles (`--messages-out`, `--messages-min-len`,
+`--messages-include-all`, `--no-messages`)
 
 **extract-modules options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, `--dry-run`, `--force`
 

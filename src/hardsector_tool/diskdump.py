@@ -609,6 +609,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("out_dir", type=Path, help="Reconstruction output directory")
     scan.add_argument("--out", required=True, type=Path, help="Output JSON path")
+    scan.add_argument(
+        "--messages-out",
+        type=Path,
+        help="Optional TSV output for extracted message strings",
+    )
+    scan.add_argument(
+        "--messages-min-len",
+        type=int,
+        default=6,
+        help="Minimum string length to consider when scanning for message catalogs",
+    )
+    scan.add_argument(
+        "--messages-include-all",
+        action="store_true",
+        help="Write strings for all sectors to TSV, not just candidates",
+    )
+    scan.add_argument(
+        "--no-messages",
+        dest="messages_enabled",
+        action="store_false",
+        help="Disable message catalog scan",
+    )
+    scan.set_defaults(messages_enabled=True)
 
     from . import catalog_report, extractmods
 
@@ -651,7 +674,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="[SCP QC] Hard-sector holes per rotation",
     )
     qc.add_argument(
-        "--revs", type=int, default=None, help="[SCP QC] Expected revolutions for capture"
+        "--revs",
+        type=int,
+        default=None,
+        help="[SCP QC] Expected revolutions for capture",
     )
     qc.add_argument(
         "--fail-thresholds",
@@ -772,7 +798,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "scan-metadata":
         from . import scanmeta
 
-        result = scanmeta.scan_metadata(args.out_dir)
+        result = scanmeta.scan_metadata(
+            args.out_dir,
+            messages_min_len=args.messages_min_len,
+            messages_include_all=args.messages_include_all,
+            messages_enabled=args.messages_enabled,
+            messages_out=args.messages_out,
+        )
         args.out.write_text(json.dumps(result, indent=2))
         return 0
 
