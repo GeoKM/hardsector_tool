@@ -8,6 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from conftest import repo_src_path, require_fixture
+
+
+pytestmark = pytest.mark.slow
+
 
 FIXTURES = [
     Path("tests/ACMS80217/ACMS80217-HS32.scp"),
@@ -17,9 +22,12 @@ FIXTURES = [
 
 @pytest.mark.parametrize("fixture_path", FIXTURES)
 def test_reconstruct_disk_track0(tmp_path: Path, fixture_path: Path) -> None:
+    fixture_path = require_fixture(fixture_path)
     out_dir = tmp_path / "reconstruct"
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(repo_src_path()), env.get("PYTHONPATH")])
+    )
 
     cmd = [
         sys.executable,
@@ -51,9 +59,12 @@ def test_reconstruct_disk_track0(tmp_path: Path, fixture_path: Path) -> None:
 
 @pytest.mark.parametrize("fixture_path", FIXTURES)
 def test_reconstruct_disk_track_mapping(tmp_path: Path, fixture_path: Path) -> None:
+    fixture_path = require_fixture(fixture_path)
     out_dir = tmp_path / "reconstruct_mapping"
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(repo_src_path()), env.get("PYTHONPATH")])
+    )
 
     cmd = [
         sys.executable,

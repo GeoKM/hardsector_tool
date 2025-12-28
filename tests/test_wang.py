@@ -2,16 +2,21 @@ from pathlib import Path
 
 import pytest
 
+from conftest import require_fixture
 from hardsector_tool.hardsector import group_hard_sectors, pair_holes
 from hardsector_tool.scp import SCPImage
 from hardsector_tool.wang import reconstruct_track, scan_wang_frames
+
+pytestmark = pytest.mark.slow
 
 FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
 FIXTURE_221 = Path("tests/ACMS80221/ACMS80221-HS32.scp")
 
 
 def test_wang_scan_frame_detects_headers() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     track = image.read_track(0)
     assert track is not None
 
@@ -44,7 +49,9 @@ def test_scan_wang_frames_accepts_plausible_offsets() -> None:
 
 
 def test_reconstruct_track_sets_window_metadata() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     reconstructed, recon, _ = reconstruct_track(
         image,
         0,
@@ -61,7 +68,9 @@ def test_reconstruct_track_sets_window_metadata() -> None:
 
 
 def test_reconstruct_track_supports_unpaired_sectors() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     reconstructed, _, _ = reconstruct_track(
         image,
         0,
@@ -78,10 +87,9 @@ def test_reconstruct_track_supports_unpaired_sectors() -> None:
 
 
 def test_reconstruct_track_promotes_dominant_transform_family() -> None:
-    if not FIXTURE_221.exists():
-        pytest.skip("ACMS80221 fixture missing")
+    fixture = require_fixture(FIXTURE_221)
 
-    image = SCPImage.from_file(FIXTURE_221)
+    image = SCPImage.from_file(fixture)
     reconstructed, _, _ = reconstruct_track(
         image,
         0,

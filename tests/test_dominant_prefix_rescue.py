@@ -2,15 +2,18 @@ from pathlib import Path
 
 import pytest
 
+from conftest import require_fixture
 from hardsector_tool.scp import SCPImage
 from hardsector_tool.wang import checksum_prefixes, dominant_prefix, reconstruct_track
 
+pytestmark = pytest.mark.slow
+
 FIXTURE = Path("tests/ACMS80221/ACMS80221-HS32.scp")
 
-
-@pytest.mark.skipif(not FIXTURE.exists(), reason="ACMS80221 fixture missing")
 def test_dominant_prefix_rescue() -> None:
-    image = SCPImage.from_file(FIXTURE)
+    fixture = require_fixture(FIXTURE)
+
+    image = SCPImage.from_file(fixture)
     sector_map, _, _ = reconstruct_track(
         image,
         track_number=0,

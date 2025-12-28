@@ -2,9 +2,12 @@ from pathlib import Path
 
 import pytest
 
+from conftest import require_fixture
 from hardsector_tool.scp import SCPImage
 
-FIXTURE = Path("tests/ACMS80217/ACMS80217-HS32.scp")
+pytestmark = pytest.mark.slow
+
+FIXTURE = require_fixture(Path("tests/ACMS80217/ACMS80217-HS32.scp"))
 
 
 @pytest.fixture(scope="session")
