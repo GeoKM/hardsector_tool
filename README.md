@@ -48,224 +48,143 @@ pip install -e .
 
 ---
 
-## Quickstart workflow
+## Suggested workflows
 
-### Step 0.5 — QC the capture or reconstruction
+### Workflow A — Triage a new disk (recommended default)
 
-Use `qc-capture` to generate a preservation-focused report (brief by default, detail for deeper evidence). The command prints a
-human-readable summary and writes JSON alongside the inputs unless `--out` is provided.
+1. **QC capture (flux heuristics + reconstruction health)**
+
+   ```bash
+   python -m hardsector_tool qc-capture <image.scp> \
+     --mode detail \
+     --track-step auto \
+     --tracks 0-76
+   ```
+
+2. **Reconstruction (derived artefact)**
+
+   ```bash
+   python -m hardsector_tool reconstruct-disk <image.scp> \
+     --out <recon_dir> \
+     --track-step auto \
+     --keep-best 2 \
+     --force
+   ```
+
+3. **Scan metadata + message extraction (evidence-only)**
+
+   ```bash
+   python -m hardsector_tool scan-metadata <recon_dir> \
+     --out <recon_dir>/scanmeta.json \
+     --messages-out <recon_dir>/messages.tsv
+   ```
+
+4. **Write a short evidence note**
+
+   * inferred geometry / assumptions used
+   * QC summary PASS/WARN
+   * any revision markers and message keyword clusters
+
+### Workflow B — Reverse engineering / hypothesis-driven work
+
+1. Use scanmeta to identify candidate regions.
+2. Run catalog-report:
+
+   ```bash
+   python -m hardsector_tool catalog-report <recon_dir> --out <reports_dir>
+   ```
+
+3. If and only if evidence exists, run extract-modules:
+
+   ```bash
+   python -m hardsector_tool extract-modules <recon_dir> \
+     --out <derived_dir> \
+     --min-refs 3
+   ```
+
+> Carved artifacts are derived. Do not claim filesystem semantics unless proven.
+
+### Example (ACMS80227)
+
+A short, ACMS-specific run after capture:
 
 ```bash
-# SCP capture integrity (full QC + reconstruction cached in .qc_cache)
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp \
-  --mode detail --sectors-per-rotation 16 --revs 5 --cache-dir .qc_cache
+python -m hardsector_tool qc-capture tests/ACMS80227/ACMS80227-HS32.scp --mode detail --track-step auto --tracks 0-76
+python -m hardsector_tool reconstruct-disk tests/ACMS80227/ACMS80227-HS32.scp --out out_acms80227 --track-step auto --keep-best 2 --force
+python -m hardsector_tool scan-metadata out_acms80227 --out out_acms80227/scanmeta.json --messages-out out_acms80227/messages.tsv
+```
 
-# Capture-only QC (skip reconstruction entirely)
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp --mode brief --no-reconstruct
+---
 
-# Explicit reconstruction target (write to a different directory than the cache)
-python -m hardsector_tool qc-capture ACMS80221-HS32.scp \
-  --mode detail --reconstruct-out out_80221_qc --force
+## Command reference
 
-# Reconstruction output health (already decoded directory)
-python -m hardsector_tool qc-capture out_80221_v3 --mode brief
-python -m hardsector_tool qc-capture out_80221_v3 --mode detail --out qc_out.json
+### QC a capture or reconstruction
+
+Generate a preservation-focused report. The command prints a human-readable summary and writes JSON alongside the inputs unless `--out` is provided.
+
+```bash
+python -m hardsector_tool qc-capture <image.scp> --mode detail --track-step auto --revs 5
+python -m hardsector_tool qc-capture <recon_dir> --mode brief
 ```
 
 Tips:
 
-* The QC JSON is saved as `qc_<image>.json` for SCP inputs or `<out_dir>/qc.json` for reconstruction directories unless `--out`
-  overrides the path.
+* The QC JSON is saved as `qc_<image>.json` for SCP inputs or `<recon_dir>/qc.json` unless `--out` overrides the path.
 * `--track-step` controls track spacing assumptions during QC reconstruction (use `--track-step 2` for even-only heads).
-* `--reconstruct-verbose` mirrors `reconstruct-disk` debugging; combine with `--show-all-tracks` in `--mode detail` to audit
-  clean tracks as well as failures.
+* `--reconstruct-verbose` mirrors `reconstruct-disk` debugging; combine with `--show-all-tracks` in `--mode detail` to audit clean tracks as well as failures.
 
-### Step 1 — Reconstruct logical sectors from a flux image
+### Reconstruct logical sectors from a flux image
 
-This produces a directory containing:
-
-* per-sector payloads (`sectors/Txx_Syy.bin`)
-* per-track reports (`tracks/*.json`)
-* `manifest.json` and summary stats
-
-Examples:
-
-* Default run (auto track step):
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_v3
-  ```
-
-* Force even-only track step:
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_step2 --track-step 2
-  ```
-
-* Explicit holes-per-rev with pruning:
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_keep5 --sectors-per-rotation 16 --keep-best 5
-  ```
-
-* (Optional) cautious debug run:
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80217-HS32.scp --out out_80217_debug --dump-raw-windows
-  ```
-
-* Force even-only track stepping (common for single-sided captures):
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_even --track-step 2
-  ```
-
-* Fast sanity run (decode just a few tracks while iterating):
-
-  ```bash
-  python -m hardsector_tool reconstruct-disk ACMS80221-HS32.scp --out out_80221_t0_5 --tracks 0-5 --side 0
-  ```
-
-Useful during development to validate decoding/mapping quickly before processing the full disk.
-
-**What you get:** a *logical sector database* suitable for analysis and repeatability. Preserve it alongside the original `.scp`.
-
----
-
-### Step 2 — Scan for metadata / candidate structures (format-agnostic)
-
-This does **not** assume a filesystem. It searches for:
-
-* text signatures (“Wang”, “SF…”, “Office Information System”, etc.)
-* dense filename-like tables (NAME.EXT)
-* repeating record cadences
-* pointer plausibility evidence (TS pairs, linear sector numbers, etc.)
+Produce a reconstruction directory containing sector payloads, per-track reports, `manifest.json`, and summary stats.
 
 ```bash
-python -m hardsector_tool scan-metadata out_80221_v3 --out scan_80221.json
-python -m hardsector_tool scan-metadata out_80217_v3 --out scan_80217.json
+python -m hardsector_tool reconstruct-disk <image.scp> --out <recon_dir> --track-step auto --keep-best 2 --force
+python -m hardsector_tool reconstruct-disk <image.scp> --out <recon_dir> --track-step 2 --tracks 0-10 --side 0
 ```
 
-`scan-metadata` accepts track diagnostics named either `tracks/track_XX.json` or
-`tracks/TXX.json`. When per-track JSONs are missing or lack a sector size,
-sector payload sizes are sampled to infer the most common logical sector size.
+Useful for validating decoding/mapping quickly before processing the full disk.
 
-Use the JSON to guide reverse engineering (what sectors look like labels/catalogs/manifests).
+### Scan for metadata / candidate structures (format-agnostic)
 
-`scan-metadata` can also flag sectors that look like packed UI/message tables (dense printable strings, revision markers, domain
-keywords such as “archive”/“checkout”/“diagnostic”). This is **evidence extraction** for disks that may not surface catalog
-names but clearly contain prompts. To export the strings it finds (by default only from candidate sectors), use:
+Search for text signatures, dense filename-like tables, repeating record cadences, and pointer evidence.
 
 ```bash
-python -m hardsector_tool scan-metadata out_80217_v3 --out scan_80217.json --messages-out messages.tsv
+python -m hardsector_tool scan-metadata <recon_dir> --out <recon_dir>/scanmeta.json
+python -m hardsector_tool scan-metadata <recon_dir> --out <recon_dir>/scanmeta.json --messages-out <recon_dir>/messages.tsv
 ```
 
----
-
-### Step 3 — Experimental “module extraction” (carving with provenance)
-
-`extract-modules` is **NOT** a general filesystem extractor.
-It attempts to carve derived payloads only when it finds:
-
-* descriptor-style records with pointer lists, and/or
-* (optionally) pointer-bearing `pppp=` manifest entries
-
-Every extracted `.bin` gets a `.json` sidecar with:
-
-* where the descriptor was found (track/sector/offset),
-* which pointer decoding hypothesis was used,
-* the exact referenced sectors (provenance),
-* warnings / missing refs.
-
-#### Basic usage
-
-```bash
-python -m hardsector_tool extract-modules out_80221_v3 --out derived_80221 --min-refs 3 --force
-python -m hardsector_tool extract-modules out_80217_v3 --out derived_80217 --min-refs 3 --force
-```
-
-* Conservative run:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80217_v3 --out derived_80217_cons --min-refs 3
-  ```
-
-* SYSGEN focus:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen --only-prefix SYSGEN. --min-refs 3
-  ```
-
-* Choose hypotheses:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80221_v3 --out derived_h13 --hypotheses H1,H3 --min-refs 3
-  ```
-
-* Toggle pppp descriptor carving:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_on --enable-pppp-descriptors --min-refs 3
-  python -m hardsector_tool extract-modules out_80221_v3 --out derived_pppp_off --no-enable-pppp-descriptors --min-refs 3
-  ```
-
-  Note: if pppp descriptors are already enabled by default in your build, you can omit `--enable-pppp-descriptors`.
-
-* Span pppp pointers across sectors:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80221_v3 --out derived_span1 --pppp-span-sectors 1 --min-refs 3
-  ```
-
-* Reduce false positives:
-
-  ```bash
-  python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen_safe --only-prefix SYSGEN. --require-name-in-pppp-list --min-refs 3
-  ```
-
-#### Focus on a module family (prefix filter)
-
-Prefix matching is normalized, so these behave the same:
-
-```bash
-python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen --only-prefix SYSGEN. --min-refs 3 --force
-python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen --only-prefix =SYSGEN. --min-refs 3 --force
-```
-
-#### Reduce false positives (recommended while reverse engineering)
-
-Only attempt extraction for true descriptor records **whose name is also present** in the disk’s `pppp=` name lists:
-
-```bash
-python -m hardsector_tool extract-modules out_80217_v3 --out derived_sysgen \
-  --only-prefix SYSGEN. \
-  --require-name-in-pppp-list \
-  --min-refs 3 --force
-```
-
-Optional pppp-based descriptor carving (if your hypothesis suggests names-with-pointers sitting in `pppp=` records) can be toggled with `--enable-pppp-descriptors`, with `--pppp-span-sectors` controlling whether to include bytes from the next sector when parsing those entries.
+Use the JSON to guide reverse engineering (what sectors look like labels/catalogs/manifests). `scan-metadata` accepts track diagnostics named either `tracks/track_XX.json` or `tracks/TXX.json`.
 
 ### Catalog reporting (evidence-only)
 
-`catalog-report` inventories descriptor-backed module candidates and name lists without writing payloads. It reuses the reconstruction cache used by `qc-capture` so running against an SCP image will transparently reconstruct into `.qc_cache/` (unless `--reconstruct-out` or `--force-reconstruct` is set). If `--out` is omitted, reports land in `<reconstruction>/catalog_report/` (or the cache reconstruction directory for SCP inputs); otherwise `catalog_report.json` and `catalog_report.txt` are written under the chosen `--out` path.
-
-Examples:
+Inventory descriptor-backed module candidates and name lists without writing payloads. If `--out` is omitted, reports land in `<recon_dir>/catalog_report/` (or the cache reconstruction directory when running directly from an SCP capture).
 
 ```bash
-# From an SCP image (reconstruction cached under .qc_cache/ by default)
-python -m hardsector_tool catalog-report tests/ACMS80217/ACMS80217-HS32.scp --out reports/acms80217 --cache-dir .qc_cache
-
-# From an existing reconstruction directory
-python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_80217_v3
-
-# Filtered view requiring names to appear in pppp lists
-python -m hardsector_tool catalog-report out_80217_v3 --out reports/out_sysgen --only-prefix SYSGEN. --require-name-in-pppp-list --enable-pppp-descriptors
+python -m hardsector_tool catalog-report <recon_dir> --out <reports_dir>
+python -m hardsector_tool catalog-report <image.scp> --out <reports_dir> --cache-dir .qc_cache
 ```
 
-Notes:
+### Experimental module extraction (carving with provenance)
 
-* SCP inputs reuse the `.qc_cache/` reconstruction cache (shared with `qc-capture`) unless you force a rerun.
-* If `--out` is omitted, catalog reports are written under `<reconstruction>/catalog_report/` (for SCP inputs this is the cache reconstruction directory).
+`extract-modules` is **NOT** a general filesystem extractor. It attempts to carve derived payloads only when descriptor-style records or `pppp=` pointer evidence is strong.
+
+```bash
+python -m hardsector_tool extract-modules <recon_dir> --out <derived_dir> --min-refs 3 --force
+python -m hardsector_tool extract-modules <recon_dir> --out <derived_dir> --only-prefix SYSGEN. --require-name-in-pppp-list --min-refs 3
+```
+
+Use `--hypotheses H1,H3` to try specific pointer decoding hypotheses or `--enable-pppp-descriptors` and `--pppp-span-sectors` when your hypothesis suggests padded `pppp=` pointers. Every extracted `.bin` gets a `.json` sidecar summarizing provenance and warnings.
+
+---
+
+## How to interpret outputs
+
+* `qc-capture`: **PASS** means per-track decode stability; **WARN** flags marginal sectors or noisy timing. Recapture when you see recurrent WARNs across multiple revolutions.
+* `manifest.json`: reconstruction decisions and stats per track; use it to explain how sector payloads were chosen.
+* `scanmeta.json`: candidate structures and clusters to guide hypotheses. It is not a filesystem decode.
+* `messages.tsv`: evidence extraction of packed UI/message tables. Offsets are byte offsets within each sector. By default only candidate sectors are included; add `--messages-include-all` to dump every sector’s strings.
+* `catalog-report`: a `0/0` result means no recognized descriptor/name-table scheme was found; it does not imply a blank disk.
+* `extract-modules`: produces carved artifacts with provenance sidecars; treat them as derived evidence, not confirmed files.
 
 ---
 
@@ -283,8 +202,7 @@ python -m hardsector_tool catalog-report --help
 
 **reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
 
-**scan-metadata options:** `--out OUT out_dir` plus message-catalog toggles (`--messages-out`, `--messages-min-len`,
-`--messages-include-all`, `--no-messages`)
+**scan-metadata options:** `--out OUT out_dir` plus message-catalog toggles (`--messages-out`, `--messages-min-len`, `--messages-include-all`, `--no-messages`)
 
 **extract-modules options:** `--out`, `--min-refs`, `--max-refs`, `--hypotheses (H1,H2,H3,H4)`, `--enable-pppp-descriptors / --no-enable-pppp-descriptors`, `--pppp-span-sectors`, `--require-name-in-pppp-list`, `--only-prefix`, `--dry-run`, `--force`
 
@@ -328,8 +246,7 @@ python -m hardsector_tool catalog-report --help
 
 ### Option glossary (pppp-related)
 
-* `--enable-pppp-descriptors` / `--no-enable-pppp-descriptors`: enable or disable treating `pppp=` entries with embedded pointers as extractable descriptors.
-  (See `--help` for default.)
+* `--enable-pppp-descriptors` / `--no-enable-pppp-descriptors`: enable or disable treating `pppp=` entries with embedded pointers as extractable descriptors. (See `--help` for default.)
 * `--pppp-span-sectors N`: allow reading pointer bytes from the next sector while decoding `pppp=` entries.
 
 ### Record types in output
@@ -346,13 +263,13 @@ This is intentional: it prevents name lists from inflating descriptor counts and
 
 ## Output directory structure
 
-### Reconstruct output (`out_*`)
+### Reconstruct output (`<recon_dir>`)
 
 * `manifest.json` — totals, mapping, track stats
 * `sectors/Txx_Syy.bin` — recovered logical sector payloads (primary analysis artifact)
 * `tracks/track_XX.json` or `tracks/TXX.json` — per-track decode diagnostics
 
-### Extract output (`derived_*`)
+### Extract output (`<derived_dir>`)
 
 * `extraction_summary.json` — overall counts, hypotheses, extracted module list
 * `<MODULE>.bin` — carved payload (derived)
@@ -365,6 +282,13 @@ This is intentional: it prevents name lists from inflating descriptor counts and
 * **Capture multiple revolutions** and retain raw flux images. If you suspect marginal media, recapture and compare.
 * Prefer using `scan-metadata` before extraction. It helps identify where the real catalog/allocation structures might live.
 * Treat extracted `.bin` files as **carved artifacts**, not “files” in the OS sense until the directory/allocation format is fully confirmed.
+
+---
+
+## Development / Tests
+
+* Run checks locally before pushing: `pytest`, `ruff check .`, and `black .`.
+* See `tests/fixtures/README.md` for optional large SCP fixtures used by slow tests.
 
 ---
 
