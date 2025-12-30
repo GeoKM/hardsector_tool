@@ -198,6 +198,10 @@ python -m hardsector_tool extract-modules --help
 python -m hardsector_tool catalog-report --help
 ```
 
+## License
+
+Licensed under the Apache License, Version 2.0. See the `LICENSE` file for details.
+
 **Top-level commands:** `hardsector_tool {reconstruct-disk,scan-metadata,extract-modules,catalog-report,qc-capture}`
 
 **reconstruct-disk options:** `--out`, `--tracks`, `--side`, `--logical-sectors`, `--track-step {auto,1,2}`, `--sectors-per-rotation`, `--sector-sizes`, `--keep-best`, `--similarity-threshold`, `--clock-factor`, `--dump-raw-windows`, `--no-json`, `--no-report`, `--force`
