@@ -9,6 +9,10 @@ description = "Tools to decode and analyze hard-sectored floppy flux images."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Contributors" }]
+license = { file = "LICENSE" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+]
 dependencies = []
 
 [project.optional-dependencies]
